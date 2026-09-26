@@ -6,6 +6,7 @@ import {
   getFileCategory,
   sanitizeFileName,
   formatFileSize,
+  normalizeUrl,
 } from '../utils/fileUtils';
 
 export type DownloadEventCallback = (download: DownloadItem) => void;
@@ -117,11 +118,12 @@ class DownloadEngine {
     customFileName?: string,
     headers?: Record<string, string>,
   ): Promise<DownloadItem> {
+    const safeUrl = normalizeUrl(url);
     const id = `dl_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const fileName = sanitizeFileName(customFileName || getFileName(url));
+    const fileName = sanitizeFileName(customFileName || getFileName(safeUrl));
     const downloadDir = this.getDownloadDir();
     const filePath = `${downloadDir}/TurboDownloader/${fileName}`;
-    const category = getFileCategory(url);
+    const category = getFileCategory(safeUrl);
 
     // Ensure download directory exists
     const dirPath = `${downloadDir}/TurboDownloader`;
@@ -132,7 +134,7 @@ class DownloadEngine {
 
     const download: DownloadItem = {
       id,
-      url,
+      url: safeUrl,
       fileName,
       filePath,
       fileSize: 0,
@@ -163,9 +165,10 @@ class DownloadEngine {
     download: DownloadItem,
     headers?: Record<string, string>,
   ): Promise<void> {
-    const { id, url } = download;
-    this.updateDownloadState(id, { status: 'downloading' });
-    this.speedTrackers.set(id, { lastBytes: 0, lastTime: Date.now(), smoothedSpeed: 0, lastNotifyTime: 0 });
+    const { id } = download;
+    const url = normalizeUrl(download.url);
+    this.updateDownloadState(id, { status: 'downloading', url });
+    this.speedTrackers.set(id, { lastBytes: download.downloadedSize || 0, lastTime: Date.now(), smoothedSpeed: 0, lastNotifyTime: 0 });
 
     const settings = await storage.getSettings();
     const configuredThreads = Math.min(Math.max(settings.threadsPerDownload || 8, 2), 12);
@@ -180,7 +183,7 @@ class DownloadEngine {
       ...headers,
     };
 
-    let totalSize = 0;
+    let totalSize = download.fileSize || 0;
     let rangeSupported = false;
     let serverFileName: string | null = null;
 
@@ -212,28 +215,30 @@ class DownloadEngine {
 
       if (acceptRanges === 'bytes' && totalSize > 2 * 1024 * 1024) {
         rangeSupported = true;
-      } else if (totalSize > 3 * 1024 * 1024) {
-        // Test range capability with 1 byte range
-        try {
-          const testRes = await fetch(url, {
-            method: 'GET',
-            headers: { ...requestHeaders, 'Range': 'bytes=0-1' },
-          });
-          if (testRes.status === 206) {
-            rangeSupported = true;
-          }
-        } catch {}
       }
     } catch (e) {
-      console.log('HEAD request skipped or failed, continuing with direct GET...', e);
+      console.log('HEAD request probe skipped or failed, continuing with Range test...', e);
+    }
+
+    // If server range is unconfirmed and file is > 2MB (or already known size), test range with quick 1-byte GET
+    if (!rangeSupported && totalSize > 2 * 1024 * 1024) {
+      try {
+        const testRes = await fetch(url, {
+          method: 'GET',
+          headers: { ...requestHeaders, 'Range': 'bytes=0-1' },
+        });
+        if (testRes.status === 206) {
+          rangeSupported = true;
+        }
+      } catch {}
     }
 
     // If server supports HTTP Range and file is > 2MB, run Multi-Threaded Download (Velocity style!)
     if (rangeSupported && totalSize > 2 * 1024 * 1024) {
-      console.log(`Starting multi-threaded download for ${download.fileName} with ${configuredThreads} threads!`);
+      console.log(`Starting/Resuming multi-threaded download for ${download.fileName} with ${configuredThreads} threads!`);
       await this._executeMultiThreadDownload(download, totalSize, configuredThreads, requestHeaders);
     } else {
-      console.log(`Starting single-threaded download for ${download.fileName}`);
+      console.log(`Starting/Resuming single-threaded download for ${download.fileName}`);
       await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
     }
   }
@@ -254,7 +259,7 @@ class DownloadEngine {
     const tasks: any[] = [];
     let isCancelled = false;
 
-    const cancelAll = () => {
+    const cancelAll = (isPaused = false) => {
       isCancelled = true;
       tasks.forEach(t => {
         try { t.cancel(); } catch (e) {}
@@ -262,7 +267,48 @@ class DownloadEngine {
     };
 
     this.activeDownloads.set(id, { cancel: cancelAll });
-    this.speedTrackers.set(id, { lastBytes: 0, lastTime: Date.now(), smoothedSpeed: 0, lastNotifyTime: 0 });
+
+    const handleProgressTick = () => {
+      const currentTotal = partBytes.reduce((a, b) => a + b, 0);
+      const now = Date.now();
+      let tracker = this.speedTrackers.get(id);
+      if (!tracker) {
+        tracker = { lastBytes: currentTotal, lastTime: now, smoothedSpeed: 0, lastNotifyTime: 0 };
+        this.speedTrackers.set(id, tracker);
+      }
+
+      // Sample speed at stable intervals (>= 300ms) to avoid violent micro-oscillations
+      const timeDiff = (now - tracker.lastTime) / 1000;
+      if (timeDiff >= 0.3) {
+        const bytesDiff = currentTotal - tracker.lastBytes;
+        if (bytesDiff >= 0) {
+          const instantSpeed = bytesDiff / timeDiff;
+          tracker.smoothedSpeed = tracker.smoothedSpeed > 0
+            ? (tracker.smoothedSpeed * 0.6 + instantSpeed * 0.4)
+            : instantSpeed;
+        }
+        tracker.lastBytes = currentTotal;
+        tracker.lastTime = now;
+      }
+
+      const cleanSpeed = (isFinite(tracker.smoothedSpeed) && tracker.smoothedSpeed > 0)
+        ? Math.round(tracker.smoothedSpeed)
+        : 0;
+
+      const safeTotal = totalSize > 0 ? totalSize : 0;
+      const safeProgress = safeTotal > 0 ? Math.min(1, Math.max(0, currentTotal / safeTotal)) : 0;
+
+      // Throttle state updates to keep UI responsive and smooth at 60fps
+      if (now - tracker.lastNotifyTime >= 250 || safeProgress >= 1) {
+        tracker.lastNotifyTime = now;
+        this.updateDownloadState(id, {
+          downloadedSize: currentTotal,
+          fileSize: safeTotal,
+          progress: safeProgress,
+          speed: cleanSpeed,
+        });
+      }
+    };
 
     try {
       const promises = [];
@@ -270,72 +316,93 @@ class DownloadEngine {
       for (let i = 0; i < numThreads; i++) {
         const start = i * chunkSize;
         const end = (i === numThreads - 1) ? totalSize - 1 : (i + 1) * chunkSize - 1;
+        const partLength = end - start + 1;
         const partPath = `${tempPrefix}${i}`;
         partPaths.push(partPath);
 
-        const config = {
-          fileCache: true,
-          path: partPath,
-          followRedirect: true,
-          IOSBackgroundTask: true,
-          overwrite: true,
-        };
+        // Check if part file already exists and has bytes from a previously paused run
+        let existingPartBytes = 0;
+        try {
+          if (await ReactNativeBlobUtil.fs.exists(partPath)) {
+            const stat = await ReactNativeBlobUtil.fs.stat(partPath);
+            existingPartBytes = Number(stat.size);
+          }
+        } catch {}
 
-        const partHeaders = {
-          ...requestHeaders,
-          'Range': `bytes=${start}-${end}`,
-        };
+        if (existingPartBytes >= partLength) {
+          // This part is ALREADY 100% completed!
+          partBytes[i] = partLength;
+          continue;
+        }
 
-        const task = ReactNativeBlobUtil.config(config)
-          .fetch('GET', url, partHeaders)
-          .progress({ count: 10, interval: 250 }, (received: number) => {
-            if (isCancelled) return;
-            partBytes[i] = Math.max(0, received);
-            const currentTotal = partBytes.reduce((a, b) => a + b, 0);
+        if (existingPartBytes > 0) {
+          // Part is partially downloaded -> Resume remaining bytes!
+          partBytes[i] = existingPartBytes;
+          const resumeStart = start + existingPartBytes;
+          const resumePartPath = `${partPath}_resume`;
 
-            const now = Date.now();
-            let tracker = this.speedTrackers.get(id);
-            if (!tracker) {
-              tracker = { lastBytes: currentTotal, lastTime: now, smoothedSpeed: 0, lastNotifyTime: 0 };
-              this.speedTrackers.set(id, tracker);
-            }
+          const config = {
+            fileCache: true,
+            path: resumePartPath,
+            followRedirect: true,
+            IOSBackgroundTask: true,
+            overwrite: true,
+          };
 
-            // Sample speed at stable intervals (>= 300ms) to avoid violent micro-oscillations
-            const timeDiff = (now - tracker.lastTime) / 1000;
-            if (timeDiff >= 0.3) {
-              const bytesDiff = currentTotal - tracker.lastBytes;
-              if (bytesDiff >= 0) {
-                const instantSpeed = bytesDiff / timeDiff;
-                tracker.smoothedSpeed = tracker.smoothedSpeed > 0
-                  ? (tracker.smoothedSpeed * 0.6 + instantSpeed * 0.4)
-                  : instantSpeed;
-              }
-              tracker.lastBytes = currentTotal;
-              tracker.lastTime = now;
-            }
+          const partHeaders = {
+            ...requestHeaders,
+            'Range': `bytes=${resumeStart}-${end}`,
+          };
 
-            const cleanSpeed = (isFinite(tracker.smoothedSpeed) && tracker.smoothedSpeed > 0)
-              ? Math.round(tracker.smoothedSpeed)
-              : 0;
+          const task = ReactNativeBlobUtil.config(config)
+            .fetch('GET', url, partHeaders)
+            .progress({ count: 10, interval: 250 }, (received: number) => {
+              if (isCancelled) return;
+              partBytes[i] = existingPartBytes + Math.max(0, received);
+              handleProgressTick();
+            });
 
-            const safeTotal = totalSize > 0 ? totalSize : 0;
-            const safeProgress = safeTotal > 0 ? Math.min(1, Math.max(0, currentTotal / safeTotal)) : 0;
-
-            // Throttle state updates to keep UI responsive and smooth at 60fps
-            if (now - tracker.lastNotifyTime >= 250 || safeProgress >= 1) {
-              tracker.lastNotifyTime = now;
-              this.updateDownloadState(id, {
-                downloadedSize: currentTotal,
-                fileSize: safeTotal,
-                progress: safeProgress,
-                speed: cleanSpeed,
-              });
-            }
+          const resumePromise = task.then(async (res: any) => {
+            const info = res.info();
+            if (info.status >= 400) throw new Error(`HTTP ${info.status}`);
+            await ReactNativeBlobUtil.fs.appendFile(partPath, resumePartPath, 'uri');
+            try { await ReactNativeBlobUtil.fs.unlink(resumePartPath); } catch (e) {}
+            return res;
           });
 
-        tasks.push(task);
-        promises.push(task);
+          tasks.push(task);
+          promises.push(resumePromise);
+        } else {
+          // Download fresh chunk
+          partBytes[i] = 0;
+          const config = {
+            fileCache: true,
+            path: partPath,
+            followRedirect: true,
+            IOSBackgroundTask: true,
+            overwrite: true,
+          };
+
+          const partHeaders = {
+            ...requestHeaders,
+            'Range': `bytes=${start}-${end}`,
+          };
+
+          const task = ReactNativeBlobUtil.config(config)
+            .fetch('GET', url, partHeaders)
+            .progress({ count: 10, interval: 250 }, (received: number) => {
+              if (isCancelled) return;
+              partBytes[i] = Math.max(0, received);
+              handleProgressTick();
+            });
+
+          tasks.push(task);
+          promises.push(task);
+        }
       }
+
+      // Initial progress update right upon starting/resuming
+      handleProgressTick();
 
       const results = await Promise.all(promises);
 
@@ -349,11 +416,11 @@ class DownloadEngine {
 
       // Concatenate parts natively using 'uri' encoding (zero JS memory overhead!)
       await ReactNativeBlobUtil.fs.cp(partPaths[0], filePath);
-      await ReactNativeBlobUtil.fs.unlink(partPaths[0]);
+      try { await ReactNativeBlobUtil.fs.unlink(partPaths[0]); } catch (e) {}
 
       for (let i = 1; i < numThreads; i++) {
         await ReactNativeBlobUtil.fs.appendFile(filePath, partPaths[i], 'uri');
-        await ReactNativeBlobUtil.fs.unlink(partPaths[i]);
+        try { await ReactNativeBlobUtil.fs.unlink(partPaths[i]); } catch (e) {}
       }
 
       const stat = await ReactNativeBlobUtil.fs.stat(filePath);
@@ -375,16 +442,18 @@ class DownloadEngine {
       this._processQueue();
 
     } catch (err: any) {
-      // Clean up temporary parts
-      for (const p of partPaths) {
-        try {
-          const ex = await ReactNativeBlobUtil.fs.exists(p);
-          if (ex) await ReactNativeBlobUtil.fs.unlink(p);
-        } catch (e) {}
+      if (isCancelled || err.message?.includes('cancel') || err.message?.includes('abort')) {
+        // User PAUSED the download: KEEP all chunk files safe on disk so resume continues seamlessly!
+        return;
       }
 
-      if (isCancelled || err.message?.includes('cancel') || err.message?.includes('abort')) {
-        return;
+      // Clean up temporary parts only on fatal unrecoverable errors
+      for (const p of partPaths) {
+        try {
+          if (await ReactNativeBlobUtil.fs.exists(p)) await ReactNativeBlobUtil.fs.unlink(p);
+          const pr = `${p}_resume`;
+          if (await ReactNativeBlobUtil.fs.exists(pr)) await ReactNativeBlobUtil.fs.unlink(pr);
+        } catch (e) {}
       }
 
       console.warn('Multi-part download error, falling back to single stream:', err.message);
@@ -399,11 +468,30 @@ class DownloadEngine {
   ): Promise<void> {
     const { id, url, filePath } = download;
     const downloadDir = this.getDownloadDir();
+    const tempPartPath = `${filePath}.part`;
+    let isCancelled = false;
 
     try {
+      // Check if partial download already exists on disk
+      let existingBytes = 0;
+      try {
+        if (await ReactNativeBlobUtil.fs.exists(tempPartPath)) {
+          const stat = await ReactNativeBlobUtil.fs.stat(tempPartPath);
+          existingBytes = Number(stat.size);
+        }
+      } catch {}
+
+      const isResuming = existingBytes > 0;
+      const fetchPath = isResuming ? `${tempPartPath}_resume` : tempPartPath;
+      const fetchHeaders = { ...requestHeaders };
+
+      if (isResuming) {
+        fetchHeaders['Range'] = `bytes=${existingBytes}-`;
+      }
+
       const config: any = {
         fileCache: true,
-        path: filePath,
+        path: fetchPath,
         followRedirect: true,
         IOSBackgroundTask: true,
         indicator: true,
@@ -415,28 +503,31 @@ class DownloadEngine {
       }
 
       const task = ReactNativeBlobUtil.config(config)
-        .fetch('GET', url, requestHeaders)
+        .fetch('GET', url, fetchHeaders)
         .progress({ count: 10, interval: 250 }, (received: number, total: number) => {
-          const safeReceived = (isFinite(received) && received >= 0) ? received : 0;
-          const actualTotal = (isFinite(total) && total > 0) ? total : (knownTotalSize > 0 ? knownTotalSize : 0);
+          if (isCancelled) return;
+          const currentReceived = existingBytes + Math.max(0, received);
+          const actualTotal = (isFinite(total) && total > 0)
+            ? (isResuming ? existingBytes + total : total)
+            : (knownTotalSize > 0 ? knownTotalSize : 0);
 
           const now = Date.now();
           let tracker = this.speedTrackers.get(id);
           if (!tracker) {
-            tracker = { lastBytes: safeReceived, lastTime: now, smoothedSpeed: 0, lastNotifyTime: 0 };
+            tracker = { lastBytes: currentReceived, lastTime: now, smoothedSpeed: 0, lastNotifyTime: 0 };
             this.speedTrackers.set(id, tracker);
           }
 
           const timeDiff = (now - tracker.lastTime) / 1000;
           if (timeDiff >= 0.3) {
-            const bytesDiff = safeReceived - tracker.lastBytes;
+            const bytesDiff = currentReceived - tracker.lastBytes;
             if (bytesDiff >= 0) {
               const instantSpeed = bytesDiff / timeDiff;
               tracker.smoothedSpeed = tracker.smoothedSpeed > 0
                 ? (tracker.smoothedSpeed * 0.6 + instantSpeed * 0.4)
                 : instantSpeed;
             }
-            tracker.lastBytes = safeReceived;
+            tracker.lastBytes = currentReceived;
             tracker.lastTime = now;
           }
 
@@ -444,12 +535,12 @@ class DownloadEngine {
             ? Math.round(tracker.smoothedSpeed)
             : 0;
 
-          const safeProgress = actualTotal > 0 ? Math.min(1, Math.max(0, safeReceived / actualTotal)) : 0;
+          const safeProgress = actualTotal > 0 ? Math.min(1, Math.max(0, currentReceived / actualTotal)) : 0;
 
           if (now - tracker.lastNotifyTime >= 250 || safeProgress >= 1) {
             tracker.lastNotifyTime = now;
             this.updateDownloadState(id, {
-              downloadedSize: safeReceived,
+              downloadedSize: currentReceived,
               fileSize: actualTotal,
               progress: safeProgress,
               speed: cleanSpeed,
@@ -457,7 +548,12 @@ class DownloadEngine {
           }
         });
 
-      this.activeDownloads.set(id, task);
+      this.activeDownloads.set(id, {
+        cancel: () => {
+          isCancelled = true;
+          try { task.cancel(); } catch (e) {}
+        },
+      });
 
       const result = await task;
       const info = result.info();
@@ -476,14 +572,25 @@ class DownloadEngine {
         throw new Error(msg);
       }
 
-      // 2. Verify downloaded file on disk
-      const stat = await ReactNativeBlobUtil.fs.stat(result.path());
+      // If resuming and server honored Range (HTTP 206), append the resume piece to main part
+      if (isResuming && httpStatus === 206) {
+        await ReactNativeBlobUtil.fs.appendFile(tempPartPath, fetchPath, 'uri');
+        try { await ReactNativeBlobUtil.fs.unlink(fetchPath); } catch (e) {}
+      } else if (isResuming && httpStatus === 200) {
+        // Server ignored Range and re-sent full file
+        await ReactNativeBlobUtil.fs.mv(fetchPath, tempPartPath);
+      }
+
+      // 2. Rename final part to complete target path
+      await ReactNativeBlobUtil.fs.mv(tempPartPath, filePath);
+
+      const stat = await ReactNativeBlobUtil.fs.stat(filePath);
       const downloadedBytes = Number(stat.size);
 
       // 3. Detect HTML error/captcha traps (e.g. 146-byte error bodies)
       if (downloadedBytes < 4096) {
         try {
-          const content = await ReactNativeBlobUtil.fs.readFile(result.path(), 'utf8');
+          const content = await ReactNativeBlobUtil.fs.readFile(filePath, 'utf8');
           const lower = content.toLowerCase();
           if (
             lower.includes('<!doctype html') ||
@@ -493,9 +600,7 @@ class DownloadEngine {
             lower.includes('access denied') ||
             lower.includes('checking your browser')
           ) {
-            try {
-              await ReactNativeBlobUtil.fs.unlink(result.path());
-            } catch (e) {}
+            try { await ReactNativeBlobUtil.fs.unlink(filePath); } catch (e) {}
 
             throw new Error(
               'The download link returned a webpage instead of the file (likely an expired or Cloudflare-protected link). Please open the movie website in the built-in browser to start the direct download.'
@@ -509,7 +614,7 @@ class DownloadEngine {
       }
 
       // 4. Check Content-Disposition for server-provided filename
-      let finalPath = result.path();
+      let finalPath = filePath;
       let finalName = download.fileName;
       const respHeaders = info.headers || {};
       const cd = respHeaders['content-disposition'] || respHeaders['Content-Disposition'];
@@ -518,7 +623,7 @@ class DownloadEngine {
         const sanitized = sanitizeFileName(serverFileName);
         const newPath = `${downloadDir}/TurboDownloader/${sanitized}`;
         try {
-          await ReactNativeBlobUtil.fs.mv(result.path(), newPath);
+          await ReactNativeBlobUtil.fs.mv(filePath, newPath);
           finalPath = newPath;
           finalName = sanitized;
         } catch (e) {}
@@ -541,7 +646,8 @@ class DownloadEngine {
       this._processQueue();
 
     } catch (error: any) {
-      if (error.message?.includes('cancel') || error.message?.includes('abort')) {
+      if (isCancelled || error.message?.includes('cancel') || error.message?.includes('abort')) {
+        // Paused by user! KEEP tempPartPath on disk so resume continues from existing bytes!
         return;
       }
 
@@ -560,13 +666,15 @@ class DownloadEngine {
   }
 
   async pauseDownload(id: string): Promise<void> {
-    const task = this.activeDownloads.get(id);
-    if (task) {
+    const active = this.activeDownloads.get(id);
+    if (active) {
       try {
-        task.cancel();
-      } catch (e) {
-        // Task may already be done
-      }
+        if (typeof active.cancel === 'function') {
+          active.cancel(true);
+        } else if (typeof active.cancel === 'function') {
+          active.cancel();
+        }
+      } catch (e) {}
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
     }
@@ -586,7 +694,6 @@ class DownloadEngine {
 
     if (download.status === 'paused' || download.status === 'failed') {
       if (this.activeDownloads.size < this.maxConcurrent) {
-        // Re-start the download (RN doesn't easily support true resume with byte ranges)
         this.updateDownloadState(id, { status: 'queued', error: undefined });
         await this._executeDownload(download);
       } else {
@@ -597,10 +704,12 @@ class DownloadEngine {
   }
 
   async cancelDownload(id: string): Promise<void> {
-    const task = this.activeDownloads.get(id);
-    if (task) {
+    const active = this.activeDownloads.get(id);
+    if (active) {
       try {
-        task.cancel();
+        if (typeof active.cancel === 'function') {
+          active.cancel();
+        }
       } catch (e) {}
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
@@ -614,14 +723,27 @@ class DownloadEngine {
       speed: 0,
     });
 
-    // Try to clean up the file
+    // Clean up any temporary part files from multi-thread
+    const downloadDir = this.getDownloadDir();
+    const tempPrefix = `${downloadDir}/TurboDownloader/.${id}_part_`;
+    for (let i = 0; i < 16; i++) {
+      try {
+        const p = `${tempPrefix}${i}`;
+        if (await ReactNativeBlobUtil.fs.exists(p)) await ReactNativeBlobUtil.fs.unlink(p);
+        const pr = `${p}_resume`;
+        if (await ReactNativeBlobUtil.fs.exists(pr)) await ReactNativeBlobUtil.fs.unlink(pr);
+      } catch (e) {}
+    }
+
+    // Clean up single thread temporary files
     const download = this.downloads.find(d => d.id === id);
     if (download?.filePath) {
       try {
-        const exists = await ReactNativeBlobUtil.fs.exists(download.filePath);
-        if (exists) {
-          await ReactNativeBlobUtil.fs.unlink(download.filePath);
-        }
+        const tp = `${download.filePath}.part`;
+        if (await ReactNativeBlobUtil.fs.exists(tp)) await ReactNativeBlobUtil.fs.unlink(tp);
+        const tpr = `${tp}_resume`;
+        if (await ReactNativeBlobUtil.fs.exists(tpr)) await ReactNativeBlobUtil.fs.unlink(tpr);
+        if (await ReactNativeBlobUtil.fs.exists(download.filePath)) await ReactNativeBlobUtil.fs.unlink(download.filePath);
       } catch (e) {}
     }
 

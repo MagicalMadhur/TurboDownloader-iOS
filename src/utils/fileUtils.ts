@@ -186,55 +186,95 @@ export function getCategoryColor(category: FileCategory): string {
   }
 }
 
-// Check if URL looks like a downloadable file
+// Legitimate downloadable file extensions for automatic download interception
+const DOWNLOADABLE_EXTENSIONS = [
+  // Video files (excluding .ts because .ts causes false positives on webpages/scripts)
+  'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'mpg', 'mpeg',
+  // Audio files
+  'mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg', 'wma', 'opus',
+  // Archives & disk images
+  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'iso', 'dmg', 'torrent',
+  // Packages & binaries
+  'apk', 'ipa', 'exe', 'msi', 'deb', 'rpm',
+  // Documents (only binary documents, no txt/csv)
+  'pdf', 'epub', 'doc', 'docx', 'xls', 'xlsx',
+];
+
+// Check if URL looks like an actual downloadable file
 export function isDownloadableUrl(url: string): boolean {
   if (!url) return false;
-  const lower = url.toLowerCase();
+  const trimmed = url.trim();
 
-  // Exclude plain web pages without download query
-  if (lower.endsWith('.html') || lower.endsWith('.htm')) {
-    return false;
-  }
+  try {
+    const parsed = new URL(trimmed);
+    const path = parsed.pathname.toLowerCase();
 
-  const downloadableExtensions = [
-    ...FILE_EXTENSIONS.video,
-    ...FILE_EXTENSIONS.audio,
-    ...FILE_EXTENSIONS.document,
-    ...FILE_EXTENSIONS.image,
-    ...FILE_EXTENSIONS.archive,
-    'apk', 'ipa', 'exe', 'msi', 'deb', 'rpm', 'bin', 'dat', 'iso', 'torrent',
-  ];
+    // 1. Explicitly ignore ordinary web pages and script handlers
+    if (
+      path.endsWith('.html') ||
+      path.endsWith('.htm') ||
+      path.endsWith('.php') ||
+      path.endsWith('.asp') ||
+      path.endsWith('.aspx') ||
+      path.endsWith('.jsp')
+    ) {
+      // Only treat as download if query params explicitly specify a downloadable file name
+      let hasFileParam = false;
+      for (const [, val] of parsed.searchParams) {
+        const vLower = val.toLowerCase();
+        if (DOWNLOADABLE_EXTENSIONS.some(ext => vLower.endsWith(`.${ext}`))) {
+          hasFileParam = true;
+          break;
+        }
+      }
+      if (!hasFileParam) return false;
+    }
 
-  // 1. Direct extension match
-  const ext = getFileExtension(url);
-  if (ext && downloadableExtensions.includes(ext)) {
-    return true;
-  }
+    // 2. Direct extension match in pathname
+    const lastDot = path.lastIndexOf('.');
+    if (lastDot !== -1) {
+      const ext = path.substring(lastDot + 1);
+      if (DOWNLOADABLE_EXTENSIONS.includes(ext)) {
+        return true;
+      }
+    }
 
-  // 2. Extension appears in URL path or query params (e.g. ?file=movie.mkv or /stream/video.mp4?token=...)
-  for (const de of downloadableExtensions) {
-    const pattern = new RegExp(`\\.${de}([?&#/]|$)`, 'i');
-    if (pattern.test(lower)) {
+    // 3. Check query parameters for direct downloadable filenames
+    for (const [, val] of parsed.searchParams) {
+      const vLower = val.toLowerCase();
+      if (DOWNLOADABLE_EXTENSIONS.some(ext => vLower.endsWith(`.${ext}`))) {
+        return true;
+      }
+    }
+
+    // 4. Check specific file hosting and download server URL patterns
+    const hostname = parsed.hostname.toLowerCase();
+    if (
+      (parsed.searchParams.has('export') && parsed.searchParams.get('export') === 'download') ||
+      parsed.searchParams.get('response-content-disposition')?.includes('attachment') ||
+      (hostname.includes('pixeldrain.com') && path.startsWith('/api/file/')) ||
+      (hostname.includes('gofile.io') && path.startsWith('/download/')) ||
+      (hostname.includes('mediafire.com') && path.includes('/file/'))
+    ) {
       return true;
     }
-  }
-
-  // 3. Common file hosting and download server URL patterns
-  if (
-    lower.includes('export=download') ||
-    lower.includes('dl=1') ||
-    lower.includes('download=true') ||
-    lower.includes('download=1') ||
-    lower.includes('action=download') ||
-    lower.includes('response-content-disposition=attachment') ||
-    (lower.includes('/api/file/') && lower.includes('download')) ||
-    (lower.includes('gofile.io/download') && !lower.endsWith('.html')) ||
-    (lower.includes('pixeldrain.com/api/file/') && lower.includes('download'))
-  ) {
-    return true;
-  }
+  } catch {}
 
   return false;
+}
+
+// Safely normalize and encode URLs to prevent iOS native NSURL nil crashes
+export function normalizeUrl(rawUrl: string): string {
+  if (!rawUrl) return '';
+  let url = rawUrl.trim();
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    url = 'https://' + url;
+  }
+  try {
+    return encodeURI(decodeURI(url));
+  } catch {
+    return url.replace(/ /g, '%20');
+  }
 }
 
 // Validate URL
@@ -249,9 +289,14 @@ export function isValidUrl(text: string): boolean {
 
 // Sanitize filename for filesystem
 export function sanitizeFileName(name: string): string {
-  return name
+  if (!name) return `download_${Date.now()}`;
+  let clean = name
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
     .replace(/\s+/g, '_')
     .replace(/_+/g, '_')
-    .substring(0, 200);
+    .trim();
+  if (!clean || clean === '.' || clean === '_') {
+    clean = `download_${Date.now()}`;
+  }
+  return clean.substring(0, 200);
 }

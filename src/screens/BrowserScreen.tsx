@@ -211,8 +211,17 @@ export function BrowserScreen() {
   };
 
   const handleDownload = async (url: string, fileName?: string) => {
-    await startDownload(url, fileName);
-    Alert.alert('Download Started! ⚡', `${fileName || 'File'} has been added to downloads.`);
+    try {
+      await startDownload(url, fileName);
+      // Wait for modal dismiss animation to complete before showing Alert to prevent iOS presentation crash
+      setTimeout(() => {
+        Alert.alert('Download Started! ⚡', `${fileName || 'File'} has been added to your downloads.`);
+      }, 450);
+    } catch (err: any) {
+      setTimeout(() => {
+        Alert.alert('Download Error', err?.message || 'Could not start download');
+      }, 450);
+    }
   };
 
   const handleShare = async () => {
@@ -305,7 +314,7 @@ export function BrowserScreen() {
             placeholderTextColor={Colors.textTertiary}
             autoCapitalize="none"
             autoCorrect={false}
-            keyboardType="url"
+            keyboardType="default"
             returnKeyType="go"
             selectTextOnFocus
             selectionColor={Colors.primary}

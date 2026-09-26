@@ -304,15 +304,21 @@ export const AD_BLOCK_JS = `
         }
         if (el && el.tagName === 'A' && el.href) {
           var href = el.href;
-          var hasDownload = el.hasAttribute('download');
-          var isDirectFile = /\.(mp4|mkv|avi|mov|wmv|flv|webm|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)(\?|#|$)/i.test(href);
-          if (hasDownload || isDirectFile) {
-            if (window.ReactNativeWebView) {
-              window.ReactNativeWebView.postMessage(JSON.stringify({
-                type: 'DOWNLOAD_CLICKED',
-                url: href,
-                title: el.getAttribute('download') || el.innerText || document.title || 'Download'
-              }));
+          if (href && href.startsWith('http')) {
+            var lowerHref = href.toLowerCase();
+            var hasDownloadAttr = el.hasAttribute('download');
+            var isDirectFile = /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)(\?|#|$)/i.test(href);
+            var isWebPage = lowerHref.endsWith('.html') || lowerHref.endsWith('.htm') || lowerHref.endsWith('.php');
+
+            if (isDirectFile || (hasDownloadAttr && !isWebPage)) {
+              if (window.ReactNativeWebView) {
+                var safeTitle = (el.getAttribute('download') || el.textContent || document.title || 'Download').trim().substring(0, 100);
+                window.ReactNativeWebView.postMessage(JSON.stringify({
+                  type: 'DOWNLOAD_CLICKED',
+                  url: href,
+                  title: safeTitle
+                }));
+              }
             }
           }
         }
