@@ -1,0 +1,171 @@
+name: Build Mobile Apps
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    name: Build iOS IPA & Simulator
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Install Bundler dependencies
+        run: bundle install
+
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          bundle exec pod install --repo-update
+        env:
+          NO_FLIPPER: 1
+
+      - name: Build iOS Device IPA (Unsigned / Sideloadable)
+        run: |
+          cd ios
+          xcodebuild \
+            -workspace TurboDownloader.xcworkspace \
+            -scheme TurboDownloader \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+          # Package into IPA
+          mkdir -p build/Payload
+          cp -r build/Build/Products/Release-iphoneos/TurboDownloader.app build/Payload/
+          cd build
+          zip -r TurboDownloader-Device.ipa Payload
+        continue-on-error: true
+
+      - name: Build iOS Simulator App
+        run: |
+          cd ios
+          xcodebuild \
+            -workspace TurboDownloader.xcworkspace \
+            -scheme TurboDownloader \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          cd build/Build/Products/Debug-iphonesimulator
+          zip -r ../../TurboDownloader-Simulator.zip TurboDownloader.app
+        continue-on-error: true
+
+      - name: Build Release IPA (Signed via Secrets if provided)
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$CERTIFICATE_BASE64" ]; then
+            echo "ℹ️ No Apple Developer signing certificates provided. Sideloadable IPA and Simulator App were created above."
+            exit 0
+          fi
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+
+          echo "$CERTIFICATE_BASE64" | base64 --decode > certificate.p12
+          security import certificate.p12 -k build.keychain -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > profile.mobileprovision
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+          cd ios
+          xcodebuild \
+            -workspace TurboDownloader.xcworkspace \
+            -scheme TurboDownloader \
+            -configuration Release \
+            -archivePath build/TurboDownloader.xcarchive \
+            archive
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/TurboDownloader.xcarchive \
+            -exportPath build/output \
+            -exportOptionsPlist ../ExportOptions.plist
+
+      - name: Upload iOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurboDownloader-iOS
+          path: |
+            ios/build/*.ipa
+            ios/build/*.zip
+            ios/build/output/*.ipa
+          if-no-files-found: ignore
+          retention-days: 30
+
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Android APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurboDownloader-Android-APK
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: ignore
+          retention-days: 30
