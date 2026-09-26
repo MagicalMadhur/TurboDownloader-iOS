@@ -33,6 +33,7 @@ export interface AppSettings {
   maxRetries: number;
   defaultSearchEngine: 'google' | 'duckduckgo' | 'bing';
   adBlockEnabled: boolean;
+  threadsPerDownload: number;
 }
 
 export interface Bookmark {
@@ -57,6 +58,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   maxRetries: 3,
   defaultSearchEngine: 'google',
   adBlockEnabled: true,
+  threadsPerDownload: 8,
 };
 
 class StorageService {

@@ -131,33 +131,77 @@ export function BrowserScreen() {
   };
 
   const handleShouldStartLoad = (event: any): boolean => {
-    const { url } = event;
+    const { url, isTopFrame, target, navigationType } = event;
     if (!url) return false;
 
     const lower = url.toLowerCase();
-    // Block rogue schemes commonly abused by ad networks
+    // 1. Block rogue schemes commonly abused by ad networks
     if (
       lower.startsWith('itms-app') ||
       lower.startsWith('market:') ||
       lower.startsWith('intent:') ||
       lower.startsWith('tel:') ||
       lower.startsWith('sms:') ||
-      lower.startsWith('mailto:')
+      lower.startsWith('mailto:') ||
+      (lower.startsWith('about:blank') && !isTopFrame)
     ) {
       return false;
     }
 
-    // Check if URL should be blocked (ads, popunders, redirects)
+    // 2. Check if URL should be blocked (ads, popunders, redirects)
     if (settings.adBlockEnabled && shouldBlockUrl(url)) {
       setBlockedCount(prev => prev + 1);
       return false;
     }
 
-    // Check if it's a downloadable file
+    // 3. Check if it's a downloadable file
     if (isDownloadableUrl(url)) {
       setPendingDownloadUrl(url);
       setShowDownloadModal(true);
       return false;
+    }
+
+    // 4. Brave-style Popup & Tab-under protection:
+    // If navigation comes from a click or script in an iframe or target='_blank'
+    // and points to a completely different untrusted domain:
+    if (settings.adBlockEnabled && currentUrl && currentUrl.startsWith('http')) {
+      try {
+        const currentHost = new URL(currentUrl).hostname.replace(/^www\./, '');
+        const targetHost = new URL(url).hostname.replace(/^www\./, '');
+
+        if (targetHost && targetHost !== currentHost) {
+          const isTrustedMediaHost = 
+            targetHost.includes('drive.google.com') ||
+            targetHost.includes('mediafire.com') ||
+            targetHost.includes('mega.nz') ||
+            targetHost.includes('pixeldrain.com') ||
+            targetHost.includes('gofile.io') ||
+            targetHost.includes('hubcloud') ||
+            targetHost.includes('gdflix') ||
+            targetHost.includes('fastdl') ||
+            targetHost.includes('1cloud') ||
+            targetHost.includes('streamtape') ||
+            targetHost.includes('doodstream') ||
+            targetHost.includes('dropbox.com') ||
+            targetHost.includes('github.com');
+
+          // If an iframe tries to navigate to an unknown third-party domain: BLOCK
+          if (!isTopFrame && !isTrustedMediaHost) {
+            setBlockedCount(prev => prev + 1);
+            return false;
+          }
+
+          // If navigationType is 'other' or target is '_blank' and not trusted:
+          // This is a classic movie site popunder / tab-under!
+          if ((target === '_blank' || navigationType === 'other') && !isTrustedMediaHost && !isDownloadableUrl(url)) {
+            const isSearchOrHome = url === DEFAULT_HOME || targetHost.includes('google.com') || targetHost.includes('duckduckgo.com');
+            if (!isSearchOrHome) {
+              setBlockedCount(prev => prev + 1);
+              return false;
+            }
+          }
+        }
+      } catch (e) {}
     }
 
     return true;
@@ -362,6 +406,8 @@ export function BrowserScreen() {
           true;
         `}
         injectedJavaScript={injectedJS}
+        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
+        injectedJavaScriptForMainFrameOnly={false}
         allowsBackForwardNavigationGestures
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
