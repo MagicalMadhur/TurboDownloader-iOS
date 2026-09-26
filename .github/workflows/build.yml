@@ -16,6 +16,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Select Xcode 16.1+
+        run: |
+          echo "Available Xcode versions:"
+          ls -d /Applications/Xcode* || true
+          if [ -d "/Applications/Xcode_16.2.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          elif [ -d "/Applications/Xcode_16.1.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.1.app
+          elif [ -d "/Applications/Xcode_16.0.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.0.app
+          fi
+          xcodebuild -version
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -52,13 +65,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO \
             build
 
-          # Package into IPA
-          mkdir -p build/Payload
-          cp -r build/Build/Products/Release-iphoneos/TurboDownloader.app build/Payload/
-          cd build
-          zip -r TurboDownloader-Device.ipa Payload
+          if [ -d "build/Build/Products/Release-iphoneos/TurboDownloader.app" ]; then
+            mkdir -p build/Payload
+            cp -r build/Build/Products/Release-iphoneos/TurboDownloader.app build/Payload/
+            cd build
+            zip -r TurboDownloader-Device.ipa Payload
+          fi
         continue-on-error: true
 
       - name: Build iOS Simulator App
@@ -74,10 +90,13 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
             build
 
-          cd build/Build/Products/Debug-iphonesimulator
-          zip -r ../../TurboDownloader-Simulator.zip TurboDownloader.app
+          if [ -d "build/Build/Products/Debug-iphonesimulator/TurboDownloader.app" ]; then
+            cd build/Build/Products/Debug-iphonesimulator
+            zip -r ../../../TurboDownloader-Simulator.zip TurboDownloader.app
+          fi
         continue-on-error: true
 
       - name: Build Release IPA (Signed via Secrets if provided)
@@ -153,8 +172,9 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK Licenses
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Build Android APK
         run: |
