@@ -59,22 +59,6 @@ export const AD_BLOCK_RULES = [
   '*.revcontent.com',
   '*.taboola.com',
   '*.outbrain.com',
-  '*.adcash.com',
-  '*.popmyads.com',
-  '*.adsupply.com',
-  '*.richpush.com',
-  '*.leadbolt.com',
-  '*.coinhive.com',
-  '*.1xbet.com',
-  '*.parimatch.com',
-  '*.bet365.com',
-  '*.melbet.com',
-  '*.mostbet.com',
-  '*.trafficstars.com',
-  '*.pushprime.com',
-  '*.propush.me',
-  '*.realsrv.com',
-
 
   // Notorious Redirect / Shortener Spam Domains
   '*.shorte.st',
@@ -253,30 +237,7 @@ export const AD_BLOCK_JS = `
       } catch(err) {}
     }
 
-    // 5. Remove injected banner and iframe ads
-    function removeAds() {
-      try {
-        var selectors = [
-          '[class*="ad-"]', '[class*="ads-"]', '[id*="ad-"]', '[id*="ads-"]',
-          'iframe[src*="ad"]', 'iframe[src*="doubleclick"]', 'iframe[src*="pop"]',
-          'iframe[src*="banner"]', 'iframe[src*="track"]', 'iframe[src*="syndication"]',
-          '.adsbygoogle', 'ins.adsbygoogle',
-          '[data-ad]', '[data-ads]', '.ad-container', '.ad-wrapper',
-          'div[class*="popunder"]', 'div[id*="popunder"]',
-          'div[class*="overlay"][style*="z-index"]'
-        ];
-        for (var s = 0; s < selectors.length; s++) {
-          var nodes = document.querySelectorAll(selectors[s]);
-          for (var k = 0; k < nodes.length; k++) {
-            nodes[k].style.setProperty('display', 'none', 'important');
-            nodes[k].style.setProperty('pointer-events', 'none', 'important');
-            nodes[k].style.height = '0';
-          }
-        }
-      } catch(e) {}
-    }
-
-    // 6. Media Sniffer (IDM style) - Detects video sources for easy 1-tap download
+    // 5. Media Sniffer (IDM style) - Detects video sources for easy 1-tap download
     function sniffMedia() {
       try {
         var videos = document.querySelectorAll('video, audio');
@@ -320,26 +281,13 @@ export const AD_BLOCK_JS = `
       }, true);
     } catch(e) {}
 
-    // Dynamic Mutation Observer: immediately annihilates dynamically injected ads
-    try {
-      var observer = new MutationObserver(function() {
-        removeAds();
-        sanitizeDOM();
-      });
-      observer.observe(document.documentElement || document.body, {
-        childList: true,
-        subtree: true
-      });
-    } catch(e) {}
-
     // Periodic sweep
     function runSweep() {
-      removeAds();
       sanitizeDOM();
       sniffMedia();
     }
 
-    setInterval(runSweep, 600);
+    setInterval(runSweep, 800);
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', runSweep);
     } else {
@@ -357,14 +305,12 @@ export const AD_BLOCK_JS = `
         if (el && el.tagName === 'A' && el.href) {
           var href = el.href;
           if (href && href.startsWith('http')) {
+            var lowerHref = href.toLowerCase();
+            var hasDownloadAttr = el.hasAttribute('download');
             var isDirectFile = /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)(\?|#|$)/i.test(href);
-            var dlAttr = el.getAttribute('download');
-            var isDownloadAttrFile = dlAttr && /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)$/i.test(dlAttr);
+            var isWebPage = lowerHref.endsWith('.html') || lowerHref.endsWith('.htm') || lowerHref.endsWith('.php');
 
-            if (isDirectFile || isDownloadAttrFile) {
-              e.preventDefault();
-              e.stopPropagation();
-              e.stopImmediatePropagation();
+            if (isDirectFile || (hasDownloadAttr && !isWebPage)) {
               if (window.ReactNativeWebView) {
                 var safeTitle = (el.getAttribute('download') || el.textContent || document.title || 'Download').trim().substring(0, 100);
                 window.ReactNativeWebView.postMessage(JSON.stringify({
@@ -373,7 +319,6 @@ export const AD_BLOCK_JS = `
                   title: safeTitle
                 }));
               }
-              return false;
             }
           }
         }

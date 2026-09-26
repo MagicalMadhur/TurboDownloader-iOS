@@ -146,52 +146,6 @@ export function BrowserScreen() {
     } catch (e) {}
   };
 
-  const isAllowedDestination = (targetUrl: string, basePageUrl: string): boolean => {
-    if (!targetUrl) return false;
-    if (!basePageUrl || !basePageUrl.startsWith('http')) return true;
-
-    try {
-      const currentHost = new URL(basePageUrl).hostname.replace(/^www\./, '').toLowerCase();
-      const targetHost = new URL(targetUrl).hostname.replace(/^www\./, '').toLowerCase();
-
-      // 1. Same host or subdomains (e.g. yomovies opening its own quality / stream links)
-      if (
-        targetHost === currentHost ||
-        targetHost.endsWith(`.${currentHost}`) ||
-        currentHost.endsWith(`.${targetHost}`) ||
-        (currentHost.split('.')[0].length > 3 && targetHost.includes(currentHost.split('.')[0]))
-      ) {
-        return true;
-      }
-
-      // 2. Search engines and default home
-      if (
-        targetUrl === DEFAULT_HOME ||
-        targetHost.includes('google.com') ||
-        targetHost.includes('duckduckgo.com') ||
-        targetHost.includes('bing.com')
-      ) {
-        return true;
-      }
-
-      // 3. Trusted streaming providers, cloud storage & movie download resolvers
-      const TRUSTED_HOSTS = [
-        'drive.google.com', 'mediafire.com', 'mega.nz', 'pixeldrain.com',
-        'gofile.io', 'hubcloud', 'gdflix', 'fastdl', '1cloud',
-        'streamtape', 'doodstream', 'dood.', 'streamwish', 'filelions',
-        'vidsrc', 'vidmoly', 'mixdrop', 'upstream', 'krakenfiles',
-        'katdrive', 'gdtot', 'sharedrive', 'dropbox.com', 'github.com',
-        'yomovies', 'vegamovies', 'droplink', 'gplinks', 'linkvertise',
-        'rocklinks', 'techyblogs', 'gadgetsweb', 'modijiurl', 'dulink',
-        'tnlink', 'ez4short', 'shrinkme'
-      ];
-
-      return TRUSTED_HOSTS.some(host => targetHost.includes(host));
-    } catch {
-      return false;
-    }
-  };
-
   const handleShouldStartLoad = (event: any): boolean => {
     const { url, isTopFrame, target, navigationType } = event;
     if (!url) return false;
@@ -228,19 +182,43 @@ export function BrowserScreen() {
     // If navigation comes from a click or script in an iframe or target='_blank'
     // and points to a completely different untrusted domain:
     if (settings.adBlockEnabled && currentUrl && currentUrl.startsWith('http')) {
-      const isAllowed = isAllowedDestination(url, currentUrl);
+      try {
+        const currentHost = new URL(currentUrl).hostname.replace(/^www\./, '');
+        const targetHost = new URL(url).hostname.replace(/^www\./, '');
 
-      // If an iframe tries to navigate to an unknown third-party domain: BLOCK
-      if (!isTopFrame && !isAllowed) {
-        setBlockedCount(prev => prev + 1);
-        return false;
-      }
+        if (targetHost && targetHost !== currentHost) {
+          const isTrustedMediaHost = 
+            targetHost.includes('drive.google.com') ||
+            targetHost.includes('mediafire.com') ||
+            targetHost.includes('mega.nz') ||
+            targetHost.includes('pixeldrain.com') ||
+            targetHost.includes('gofile.io') ||
+            targetHost.includes('hubcloud') ||
+            targetHost.includes('gdflix') ||
+            targetHost.includes('fastdl') ||
+            targetHost.includes('1cloud') ||
+            targetHost.includes('streamtape') ||
+            targetHost.includes('doodstream') ||
+            targetHost.includes('dropbox.com') ||
+            targetHost.includes('github.com');
 
-      // If navigationType is 'other' or target is '_blank' and not an allowed destination:
-      if ((target === '_blank' || navigationType === 'other') && !isAllowed && !isDownloadableUrl(url)) {
-        setBlockedCount(prev => prev + 1);
-        return false;
-      }
+          // If an iframe tries to navigate to an unknown third-party domain: BLOCK
+          if (!isTopFrame && !isTrustedMediaHost) {
+            setBlockedCount(prev => prev + 1);
+            return false;
+          }
+
+          // If navigationType is 'other' or target is '_blank' and not trusted:
+          // This is a classic movie site popunder / tab-under!
+          if ((target === '_blank' || navigationType === 'other') && !isTrustedMediaHost && !isDownloadableUrl(url)) {
+            const isSearchOrHome = url === DEFAULT_HOME || targetHost.includes('google.com') || targetHost.includes('duckduckgo.com');
+            if (!isSearchOrHome) {
+              setBlockedCount(prev => prev + 1);
+              return false;
+            }
+          }
+        }
+      } catch (e) {}
     }
 
     return true;
@@ -432,40 +410,6 @@ export function BrowserScreen() {
         onLoadStart={() => setIsLoading(true)}
         onLoadEnd={() => setIsLoading(false)}
         onLoadProgress={({ nativeEvent }) => setProgress(nativeEvent.progress)}
-        onFileDownload={({ nativeEvent }) => {
-          const downloadUrl = nativeEvent?.downloadUrl;
-          if (downloadUrl) {
-            const safeUrl = normalizeUrl(downloadUrl);
-            setPendingDownloadUrl(safeUrl);
-            setShowDownloadModal(true);
-          }
-        }}
-        onError={e => console.log('WebView load error:', e.nativeEvent?.description)}
-        onHttpError={e => console.log('WebView HTTP error:', e.nativeEvent?.statusCode)}
-        onOpenWindow={({ nativeEvent }) => {
-          const targetUrl = nativeEvent?.targetUrl;
-          if (!targetUrl) return;
-          const safeUrl = normalizeUrl(targetUrl);
-          if (isDownloadableUrl(safeUrl)) {
-            setPendingDownloadUrl(safeUrl);
-            setShowDownloadModal(true);
-            return;
-          }
-
-          if (shouldBlockUrl(safeUrl)) {
-            setBlockedCount(prev => prev + 1);
-            return;
-          }
-
-          if (isAllowedDestination(safeUrl, currentUrl)) {
-            // Forward to legitimate destination page on same site or trusted host
-            setCurrentUrl(safeUrl);
-            return;
-          }
-
-          // Strictly block all untrusted popup and popunder ads
-          setBlockedCount(prev => prev + 1);
-        }}
         setSupportMultipleWindows={false}
         javaScriptCanOpenWindowsAutomatically={false}
         injectedJavaScriptBeforeContentLoaded={`
