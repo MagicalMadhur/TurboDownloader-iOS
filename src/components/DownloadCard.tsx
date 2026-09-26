@@ -77,14 +77,18 @@ export function DownloadCard({
   const getStatusText = () => {
     switch (download.status) {
       case 'downloading':
-        const eta = download.speed > 0
-          ? formatDuration((download.fileSize - download.downloadedSize) / download.speed)
+        const cleanSpeed = (isFinite(download.speed) && download.speed > 0) ? download.speed : 0;
+        const eta = (cleanSpeed > 0 && download.fileSize > download.downloadedSize)
+          ? formatDuration((download.fileSize - download.downloadedSize) / cleanSpeed)
           : '--:--';
-        return `${formatSpeed(download.speed)} · ETA ${eta}`;
+        return `${formatSpeed(cleanSpeed)} · ETA ${eta}`;
       case 'completed':
-        return `${formatFileSize(download.fileSize)} · Completed`;
+        return `${formatFileSize(download.fileSize || download.downloadedSize)} · Completed`;
       case 'paused':
-        return `Paused · ${formatFileSize(download.downloadedSize)} / ${formatFileSize(download.fileSize)}`;
+        if (download.fileSize > 0) {
+          return `Paused · ${formatFileSize(download.downloadedSize)} / ${formatFileSize(download.fileSize)}`;
+        }
+        return `Paused · ${formatFileSize(download.downloadedSize)}`;
       case 'failed':
         return download.error || 'Download failed';
       case 'queued':
@@ -138,7 +142,9 @@ export function DownloadCard({
             {/* Percentage */}
             {download.status === 'downloading' && (
               <Text style={styles.percentage}>
-                {Math.round(download.progress * 100)}%
+                {download.fileSize > 0
+                  ? `${Math.min(100, Math.max(0, Math.round((download.progress || 0) * 100)))}%`
+                  : '⚡'}
               </Text>
             )}
           </View>
@@ -168,7 +174,9 @@ export function DownloadCard({
                 )}
               </View>
               <Text style={styles.sizeText}>
-                {formatFileSize(download.downloadedSize)} / {formatFileSize(download.fileSize)}
+                {download.fileSize > 0
+                  ? `${formatFileSize(download.downloadedSize)} / ${formatFileSize(download.fileSize)}`
+                  : `${formatFileSize(download.downloadedSize)} downloaded`}
               </Text>
             </View>
           )}

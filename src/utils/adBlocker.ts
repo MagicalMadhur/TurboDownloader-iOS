@@ -294,9 +294,29 @@ export const AD_BLOCK_JS = `
       runSweep();
     }
 
-    // Capture clicks and ensure overlay won't trigger ad navigation
+    // Capture clicks: clean overlays and intercept direct file download clicks
     document.addEventListener('click', function(e) {
       sanitizeDOM();
+      try {
+        var el = e.target;
+        while (el && el.tagName !== 'A' && el.tagName !== 'BODY') {
+          el = el.parentElement;
+        }
+        if (el && el.tagName === 'A' && el.href) {
+          var href = el.href;
+          var hasDownload = el.hasAttribute('download');
+          var isDirectFile = /\.(mp4|mkv|avi|mov|wmv|flv|webm|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)(\?|#|$)/i.test(href);
+          if (hasDownload || isDirectFile) {
+            if (window.ReactNativeWebView) {
+              window.ReactNativeWebView.postMessage(JSON.stringify({
+                type: 'DOWNLOAD_CLICKED',
+                url: href,
+                title: el.getAttribute('download') || el.innerText || document.title || 'Download'
+              }));
+            }
+          }
+        }
+      } catch(err) {}
     }, true);
   })();
   true;

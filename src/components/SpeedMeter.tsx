@@ -12,8 +12,10 @@ export function SpeedMeter({ speed, activeCount }: Props) {
   const glowAnim = useRef(new Animated.Value(0)).current;
   const scaleAnim = useRef(new Animated.Value(0.95)).current;
 
+  const cleanSpeed = (isFinite(speed) && speed > 0) ? speed : 0;
+
   useEffect(() => {
-    if (speed > 0) {
+    if (cleanSpeed > 0) {
       Animated.parallel([
         Animated.loop(
           Animated.sequence([
@@ -42,12 +44,12 @@ export function SpeedMeter({ speed, activeCount }: Props) {
         useNativeDriver: true,
       }).start();
     }
-  }, [speed > 0]);
+  }, [cleanSpeed > 0]);
 
   const getSpeedLevel = (): { label: string; color: string } => {
-    if (speed === 0) return { label: 'IDLE', color: Colors.textTertiary };
-    if (speed < 500 * 1024) return { label: 'NORMAL', color: Colors.warning };
-    if (speed < 2 * 1024 * 1024) return { label: 'FAST', color: Colors.accent };
+    if (cleanSpeed === 0) return { label: 'IDLE', color: Colors.textTertiary };
+    if (cleanSpeed < 500 * 1024) return { label: 'NORMAL', color: Colors.warning };
+    if (cleanSpeed < 2 * 1024 * 1024) return { label: 'FAST', color: Colors.accent };
     return { label: 'TURBO', color: Colors.success };
   };
 
@@ -56,7 +58,7 @@ export function SpeedMeter({ speed, activeCount }: Props) {
   return (
     <Animated.View style={[styles.container, { transform: [{ scale: scaleAnim }] }]}>
       {/* Glow effect when downloading */}
-      {speed > 0 && (
+      {cleanSpeed > 0 && (
         <Animated.View
           style={[
             styles.glowEffect,
@@ -71,10 +73,10 @@ export function SpeedMeter({ speed, activeCount }: Props) {
 
       <View style={styles.innerContent}>
         <View style={styles.speedRow}>
-          <Text style={styles.rocketIcon}>{speed > 0 ? '🚀' : '💤'}</Text>
+          <Text style={styles.rocketIcon}>{cleanSpeed > 0 ? '🚀' : '💤'}</Text>
           <View>
             <Text style={[styles.speedValue, { color }]}>
-              {formatSpeed(speed)}
+              {formatSpeed(cleanSpeed)}
             </Text>
             <View style={styles.labelRow}>
               <View style={[styles.dot, { backgroundColor: color }]} />
@@ -91,7 +93,7 @@ export function SpeedMeter({ speed, activeCount }: Props) {
           <View style={styles.statDivider} />
           <View style={styles.stat}>
             <Text style={styles.statValue}>
-              {speed > 0 ? '⚡' : '—'}
+              {cleanSpeed > 0 ? '⚡' : '—'}
             </Text>
             <Text style={styles.statLabel}>Status</Text>
           </View>

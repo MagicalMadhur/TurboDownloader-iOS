@@ -38,13 +38,20 @@ function parseContentDispositionFileName(headerValue?: string | null): string | 
   return null;
 }
 
+interface SpeedTracker {
+  lastBytes: number;
+  lastTime: number;
+  smoothedSpeed: number;
+  lastNotifyTime: number;
+}
+
 class DownloadEngine {
   private activeDownloads: Map<string, any> = new Map();
   private downloadQueue: string[] = [];
   private maxConcurrent: number = 3;
   private listeners: Set<DownloadListCallback> = new Set();
   private downloads: DownloadItem[] = [];
-  private speedTrackers: Map<string, { lastBytes: number; lastTime: number }> = new Map();
+  private speedTrackers: Map<string, SpeedTracker> = new Map();
 
   async initialize(): Promise<void> {
     this.downloads = await storage.getDownloads();
@@ -158,7 +165,7 @@ class DownloadEngine {
   ): Promise<void> {
     const { id, url } = download;
     this.updateDownloadState(id, { status: 'downloading' });
-    this.speedTrackers.set(id, { lastBytes: 0, lastTime: Date.now() });
+    this.speedTrackers.set(id, { lastBytes: 0, lastTime: Date.now(), smoothedSpeed: 0, lastNotifyTime: 0 });
 
     const settings = await storage.getSettings();
     const configuredThreads = Math.min(Math.max(settings.threadsPerDownload || 8, 2), 12);
@@ -255,7 +262,7 @@ class DownloadEngine {
     };
 
     this.activeDownloads.set(id, { cancel: cancelAll });
-    this.speedTrackers.set(id, { lastBytes: 0, lastTime: Date.now() });
+    this.speedTrackers.set(id, { lastBytes: 0, lastTime: Date.now(), smoothedSpeed: 0, lastNotifyTime: 0 });
 
     try {
       const promises = [];
@@ -281,27 +288,49 @@ class DownloadEngine {
 
         const task = ReactNativeBlobUtil.config(config)
           .fetch('GET', url, partHeaders)
-          .progress({ count: 10, interval: 200 }, (received: number) => {
+          .progress({ count: 10, interval: 250 }, (received: number) => {
             if (isCancelled) return;
-            partBytes[i] = received;
+            partBytes[i] = Math.max(0, received);
             const currentTotal = partBytes.reduce((a, b) => a + b, 0);
 
             const now = Date.now();
-            const tracker = this.speedTrackers.get(id);
-            let speed = 0;
-            if (tracker) {
-              const timeDiff = (now - tracker.lastTime) / 1000;
-              const bytesDiff = currentTotal - tracker.lastBytes;
-              if (timeDiff > 0) speed = bytesDiff / timeDiff;
-              this.speedTrackers.set(id, { lastBytes: currentTotal, lastTime: now });
+            let tracker = this.speedTrackers.get(id);
+            if (!tracker) {
+              tracker = { lastBytes: currentTotal, lastTime: now, smoothedSpeed: 0, lastNotifyTime: 0 };
+              this.speedTrackers.set(id, tracker);
             }
 
-            this.updateDownloadState(id, {
-              downloadedSize: currentTotal,
-              fileSize: totalSize,
-              progress: Math.min(currentTotal / totalSize, 1),
-              speed,
-            });
+            // Sample speed at stable intervals (>= 300ms) to avoid violent micro-oscillations
+            const timeDiff = (now - tracker.lastTime) / 1000;
+            if (timeDiff >= 0.3) {
+              const bytesDiff = currentTotal - tracker.lastBytes;
+              if (bytesDiff >= 0) {
+                const instantSpeed = bytesDiff / timeDiff;
+                tracker.smoothedSpeed = tracker.smoothedSpeed > 0
+                  ? (tracker.smoothedSpeed * 0.6 + instantSpeed * 0.4)
+                  : instantSpeed;
+              }
+              tracker.lastBytes = currentTotal;
+              tracker.lastTime = now;
+            }
+
+            const cleanSpeed = (isFinite(tracker.smoothedSpeed) && tracker.smoothedSpeed > 0)
+              ? Math.round(tracker.smoothedSpeed)
+              : 0;
+
+            const safeTotal = totalSize > 0 ? totalSize : 0;
+            const safeProgress = safeTotal > 0 ? Math.min(1, Math.max(0, currentTotal / safeTotal)) : 0;
+
+            // Throttle state updates to keep UI responsive and smooth at 60fps
+            if (now - tracker.lastNotifyTime >= 250 || safeProgress >= 1) {
+              tracker.lastNotifyTime = now;
+              this.updateDownloadState(id, {
+                downloadedSize: currentTotal,
+                fileSize: safeTotal,
+                progress: safeProgress,
+                speed: cleanSpeed,
+              });
+            }
           });
 
         tasks.push(task);
@@ -387,29 +416,45 @@ class DownloadEngine {
 
       const task = ReactNativeBlobUtil.config(config)
         .fetch('GET', url, requestHeaders)
-        .progress({ count: 10, interval: 200 }, (received: number, total: number) => {
-          const now = Date.now();
-          const tracker = this.speedTrackers.get(id);
+        .progress({ count: 10, interval: 250 }, (received: number, total: number) => {
+          const safeReceived = (isFinite(received) && received >= 0) ? received : 0;
+          const actualTotal = (isFinite(total) && total > 0) ? total : (knownTotalSize > 0 ? knownTotalSize : 0);
 
-          let speed = 0;
-          if (tracker) {
-            const timeDiff = (now - tracker.lastTime) / 1000;
-            const bytesDiff = received - tracker.lastBytes;
-            if (timeDiff > 0) {
-              speed = bytesDiff / timeDiff;
-            }
-            this.speedTrackers.set(id, { lastBytes: received, lastTime: now });
+          const now = Date.now();
+          let tracker = this.speedTrackers.get(id);
+          if (!tracker) {
+            tracker = { lastBytes: safeReceived, lastTime: now, smoothedSpeed: 0, lastNotifyTime: 0 };
+            this.speedTrackers.set(id, tracker);
           }
 
-          const actualTotal = total > 0 ? total : knownTotalSize;
-          const progress = actualTotal > 0 ? received / actualTotal : 0;
+          const timeDiff = (now - tracker.lastTime) / 1000;
+          if (timeDiff >= 0.3) {
+            const bytesDiff = safeReceived - tracker.lastBytes;
+            if (bytesDiff >= 0) {
+              const instantSpeed = bytesDiff / timeDiff;
+              tracker.smoothedSpeed = tracker.smoothedSpeed > 0
+                ? (tracker.smoothedSpeed * 0.6 + instantSpeed * 0.4)
+                : instantSpeed;
+            }
+            tracker.lastBytes = safeReceived;
+            tracker.lastTime = now;
+          }
 
-          this.updateDownloadState(id, {
-            downloadedSize: received,
-            fileSize: actualTotal,
-            progress: Math.min(progress, 1),
-            speed,
-          });
+          const cleanSpeed = (isFinite(tracker.smoothedSpeed) && tracker.smoothedSpeed > 0)
+            ? Math.round(tracker.smoothedSpeed)
+            : 0;
+
+          const safeProgress = actualTotal > 0 ? Math.min(1, Math.max(0, safeReceived / actualTotal)) : 0;
+
+          if (now - tracker.lastNotifyTime >= 250 || safeProgress >= 1) {
+            tracker.lastNotifyTime = now;
+            this.updateDownloadState(id, {
+              downloadedSize: safeReceived,
+              fileSize: actualTotal,
+              progress: safeProgress,
+              speed: cleanSpeed,
+            });
+          }
         });
 
       this.activeDownloads.set(id, task);
@@ -649,7 +694,10 @@ class DownloadEngine {
   getTotalSpeed(): number {
     return this.downloads
       .filter(d => d.status === 'downloading')
-      .reduce((sum, d) => sum + d.speed, 0);
+      .reduce((sum, d) => {
+        const s = (isFinite(d.speed) && d.speed > 0) ? d.speed : 0;
+        return sum + s;
+      }, 0);
   }
 
   updateMaxConcurrent(max: number): void {

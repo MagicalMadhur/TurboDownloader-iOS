@@ -126,6 +126,9 @@ export function BrowserScreen() {
           if (prev.some(m => m.url === data.url)) return prev;
           return [...prev, { url: data.url, title: data.title || pageTitle || 'Video' }];
         });
+      } else if (data.type === 'DOWNLOAD_CLICKED' && data.url) {
+        setPendingDownloadUrl(data.url);
+        setShowDownloadModal(true);
       }
     } catch (e) {}
   };

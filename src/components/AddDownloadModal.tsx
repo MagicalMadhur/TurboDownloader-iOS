@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -26,6 +26,22 @@ export function AddDownloadModal({ visible, onClose, onStartDownload, initialUrl
   const [fileName, setFileName] = useState('');
   const [isValidating, setIsValidating] = useState(false);
 
+  // Automatically synchronize initialUrl when modal opens or url changes
+  useEffect(() => {
+    if (visible) {
+      const incoming = (initialUrl || '').trim();
+      setUrl(incoming);
+      if (incoming && isValidUrl(incoming)) {
+        setFileName(getFileName(incoming));
+      } else {
+        setFileName('');
+      }
+    } else {
+      setUrl('');
+      setFileName('');
+    }
+  }, [visible, initialUrl]);
+
   const handleSubmit = () => {
     const trimmedUrl = url.trim();
     if (!trimmedUrl) {
@@ -47,14 +63,14 @@ export function AddDownloadModal({ visible, onClose, onStartDownload, initialUrl
 
   const handlePaste = async () => {
     try {
-      // Use the Clipboard API if available
-      const Clipboard = require('react-native').Clipboard;
-      if (Clipboard) {
+      const { Clipboard } = require('react-native');
+      if (Clipboard && Clipboard.getString) {
         const text = await Clipboard.getString();
-        if (text) {
-          setUrl(text);
-          if (isValidUrl(text)) {
-            setFileName(getFileName(text));
+        if (text && typeof text === 'string') {
+          const trimmed = text.trim();
+          setUrl(trimmed);
+          if (isValidUrl(trimmed)) {
+            setFileName(getFileName(trimmed));
           }
         }
       }
@@ -65,8 +81,9 @@ export function AddDownloadModal({ visible, onClose, onStartDownload, initialUrl
 
   const handleUrlChange = (text: string) => {
     setUrl(text);
-    if (isValidUrl(text) && !fileName) {
-      setFileName(getFileName(text));
+    const trimmed = text.trim();
+    if (isValidUrl(trimmed)) {
+      setFileName(getFileName(trimmed));
     }
   };
 

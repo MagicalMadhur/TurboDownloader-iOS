@@ -24,17 +24,32 @@ const MIME_TO_CATEGORY: Record<string, FileCategory> = {
 };
 
 export function getFileExtension(url: string): string {
+  if (!url) return '';
   try {
     const urlObj = new URL(url);
+    // 1. Check pathname
     const pathname = urlObj.pathname;
     const lastDot = pathname.lastIndexOf('.');
-    if (lastDot === -1) return '';
-    return pathname.substring(lastDot + 1).toLowerCase().split('?')[0];
+    if (lastDot !== -1) {
+      const ext = pathname.substring(lastDot + 1).toLowerCase().split('?')[0].split('#')[0];
+      if (ext && ext.length <= 8 && !ext.includes('/')) return ext;
+    }
+    // 2. Check query params (e.g. ?file=video.mkv or ?name=test.zip)
+    for (const [, val] of urlObj.searchParams) {
+      const qDot = val.lastIndexOf('.');
+      if (qDot !== -1) {
+        const qExt = val.substring(qDot + 1).toLowerCase().split('?')[0].split('#')[0];
+        if (qExt && qExt.length <= 8 && !qExt.includes('/')) return qExt;
+      }
+    }
   } catch {
     const lastDot = url.lastIndexOf('.');
-    if (lastDot === -1) return '';
-    return url.substring(lastDot + 1).toLowerCase().split('?')[0].split('#')[0];
+    if (lastDot !== -1) {
+      const ext = url.substring(lastDot + 1).toLowerCase().split('?')[0].split('#')[0];
+      if (ext && ext.length <= 8 && !ext.includes('/')) return ext;
+    }
   }
+  return '';
 }
 
 export function getFileCategory(url: string, mimeType?: string): FileCategory {
@@ -55,40 +70,70 @@ export function getFileCategory(url: string, mimeType?: string): FileCategory {
 }
 
 export function getFileName(url: string): string {
+  if (!url) return 'download_file';
   try {
     const urlObj = new URL(url);
+
+    // 1. Check common query parameters for actual file name
+    for (const param of ['filename', 'file', 'name', 'title', 'attachment_filename']) {
+      const val = urlObj.searchParams.get(param);
+      if (val) {
+        const decoded = decodeURIComponent(val).trim();
+        if (decoded && decoded.includes('.')) {
+          return sanitizeFileName(decoded);
+        }
+      }
+    }
+
+    // 2. Check pathname segments
     const pathname = urlObj.pathname;
-    const segments = pathname.split('/');
+    const segments = pathname.split('/').filter(Boolean);
     const lastSegment = segments[segments.length - 1];
     if (lastSegment) {
-      return decodeURIComponent(lastSegment);
+      const decoded = decodeURIComponent(lastSegment).trim();
+      const lower = decoded.toLowerCase();
+      // Skip generic server scripts
+      if (
+        !lower.endsWith('.php') &&
+        !lower.endsWith('.html') &&
+        !lower.endsWith('.htm') &&
+        !lower.endsWith('.asp') &&
+        !lower.endsWith('.aspx')
+      ) {
+        return sanitizeFileName(decoded);
+      }
     }
   } catch {}
   
-  // Fallback: generate name from URL
+  // Fallback: generate clean name with timestamp and extension
   const timestamp = Date.now();
   const ext = getFileExtension(url) || 'bin';
   return `download_${timestamp}.${ext}`;
 }
 
 export function formatFileSize(bytes: number): string {
-  if (bytes === 0) return '0 B';
+  if (!isFinite(bytes) || isNaN(bytes) || bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   const k = 1024;
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + units[i];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
+  const safeI = Math.max(0, i);
+  const val = bytes / Math.pow(k, safeI);
+  return `${parseFloat(val.toFixed(2))} ${units[safeI]}`;
 }
 
 export function formatSpeed(bytesPerSecond: number): string {
-  if (bytesPerSecond === 0) return '0 B/s';
+  if (!isFinite(bytesPerSecond) || isNaN(bytesPerSecond) || bytesPerSecond <= 0) return '0 B/s';
   const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
   const k = 1024;
-  const i = Math.floor(Math.log(bytesPerSecond) / Math.log(k));
-  return parseFloat((bytesPerSecond / Math.pow(k, i)).toFixed(1)) + ' ' + units[i];
+  const i = Math.min(Math.floor(Math.log(bytesPerSecond) / Math.log(k)), units.length - 1);
+  const safeI = Math.max(0, i);
+  const val = bytesPerSecond / Math.pow(k, safeI);
+  return `${parseFloat(val.toFixed(1))} ${units[safeI]}`;
 }
 
 export function formatDuration(seconds: number): string {
-  if (!isFinite(seconds) || seconds <= 0) return '--:--';
+  if (!isFinite(seconds) || isNaN(seconds) || seconds <= 0) return '--:--';
+  if (seconds > 86400 * 3) return '> 3 days';
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
@@ -151,7 +196,6 @@ export function isDownloadableUrl(url: string): boolean {
     return false;
   }
 
-  const ext = getFileExtension(url);
   const downloadableExtensions = [
     ...FILE_EXTENSIONS.video,
     ...FILE_EXTENSIONS.audio,
@@ -160,16 +204,28 @@ export function isDownloadableUrl(url: string): boolean {
     ...FILE_EXTENSIONS.archive,
     'apk', 'ipa', 'exe', 'msi', 'deb', 'rpm', 'bin', 'dat', 'iso', 'torrent',
   ];
+
+  // 1. Direct extension match
+  const ext = getFileExtension(url);
   if (ext && downloadableExtensions.includes(ext)) {
     return true;
   }
 
-  // Common file hosting and download server URL patterns
+  // 2. Extension appears in URL path or query params (e.g. ?file=movie.mkv or /stream/video.mp4?token=...)
+  for (const de of downloadableExtensions) {
+    const pattern = new RegExp(`\\.${de}([?&#/]|$)`, 'i');
+    if (pattern.test(lower)) {
+      return true;
+    }
+  }
+
+  // 3. Common file hosting and download server URL patterns
   if (
     lower.includes('export=download') ||
     lower.includes('dl=1') ||
     lower.includes('download=true') ||
     lower.includes('download=1') ||
+    lower.includes('action=download') ||
     lower.includes('response-content-disposition=attachment') ||
     (lower.includes('/api/file/') && lower.includes('download')) ||
     (lower.includes('gofile.io/download') && !lower.endsWith('.html')) ||
