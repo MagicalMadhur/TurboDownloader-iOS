@@ -357,12 +357,11 @@ export const AD_BLOCK_JS = `
         if (el && el.tagName === 'A' && el.href) {
           var href = el.href;
           if (href && href.startsWith('http')) {
-            var lowerHref = href.toLowerCase();
-            var hasDownloadAttr = el.hasAttribute('download');
             var isDirectFile = /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)(\?|#|$)/i.test(href);
-            var isWebPage = lowerHref.endsWith('.html') || lowerHref.endsWith('.htm') || lowerHref.endsWith('.php');
+            var dlAttr = el.getAttribute('download');
+            var isDownloadAttrFile = dlAttr && /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)$/i.test(dlAttr);
 
-            if (isDirectFile || (hasDownloadAttr && !isWebPage)) {
+            if (isDirectFile || isDownloadAttrFile) {
               e.preventDefault();
               e.stopPropagation();
               e.stopImmediatePropagation();
