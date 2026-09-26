@@ -7,7 +7,8 @@
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",
-    "test": "jest"
+    "test": "jest",
+    "postinstall": "node -e \"const fs=require('fs'),p='node_modules/react-native-blob-util/android/build.gradle';if(fs.existsSync(p)){fs.writeFileSync(p,fs.readFileSync(p,'utf8').replace('proguard-android.txt','proguard-android-optimize.txt'));}\""
   },
   "dependencies": {
     "react": "19.2.3",
