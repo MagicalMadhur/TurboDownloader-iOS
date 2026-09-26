@@ -427,8 +427,9 @@ export function BrowserScreen() {
           if (isDownloadableUrl(safeUrl)) {
             setPendingDownloadUrl(safeUrl);
             setShowDownloadModal(true);
-          } else if (!shouldBlockUrl(safeUrl)) {
-            setCurrentUrl(safeUrl);
+          } else {
+            // Strictly block all popup and popunder windows from movie sites
+            setBlockedCount(prev => prev + 1);
           }
         }}
         setSupportMultipleWindows={false}
