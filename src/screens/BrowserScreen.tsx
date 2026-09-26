@@ -420,6 +420,17 @@ export function BrowserScreen() {
         }}
         onError={e => console.log('WebView load error:', e.nativeEvent?.description)}
         onHttpError={e => console.log('WebView HTTP error:', e.nativeEvent?.statusCode)}
+        onOpenWindow={({ nativeEvent }) => {
+          const targetUrl = nativeEvent?.targetUrl;
+          if (!targetUrl) return;
+          const safeUrl = normalizeUrl(targetUrl);
+          if (isDownloadableUrl(safeUrl)) {
+            setPendingDownloadUrl(safeUrl);
+            setShowDownloadModal(true);
+          } else if (!shouldBlockUrl(safeUrl)) {
+            setCurrentUrl(safeUrl);
+          }
+        }}
         setSupportMultipleWindows={false}
         javaScriptCanOpenWindowsAutomatically={false}
         injectedJavaScriptBeforeContentLoaded={`

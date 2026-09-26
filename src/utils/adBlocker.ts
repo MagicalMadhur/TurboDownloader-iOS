@@ -311,6 +311,9 @@ export const AD_BLOCK_JS = `
             var isWebPage = lowerHref.endsWith('.html') || lowerHref.endsWith('.htm') || lowerHref.endsWith('.php');
 
             if (isDirectFile || (hasDownloadAttr && !isWebPage)) {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
               if (window.ReactNativeWebView) {
                 var safeTitle = (el.getAttribute('download') || el.textContent || document.title || 'Download').trim().substring(0, 100);
                 window.ReactNativeWebView.postMessage(JSON.stringify({
@@ -319,6 +322,7 @@ export const AD_BLOCK_JS = `
                   title: safeTitle
                 }));
               }
+              return false;
             }
           }
         }

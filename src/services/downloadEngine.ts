@@ -188,35 +188,48 @@ class DownloadEngine {
     };
 
     const downloadDir = this.getDownloadDir();
+    const currentFilePath = `${downloadDir}/TurboDownloader/${download.fileName}`;
     const tempPrefix = `${downloadDir}/TurboDownloader/.${id}_part_`;
-    const singlePartPath = `${download.filePath}.part`;
+    const singlePartPath = `${currentFilePath}.part`;
 
-    // 1. Strict Resume Check: If partial files already exist on disk, RESUME in their native mode!
+    // Ensure download.filePath is updated to current container
+    if (download.filePath !== currentFilePath) {
+      download.filePath = currentFilePath;
+      this.updateDownloadState(id, { filePath: currentFilePath });
+    }
+
+    // 1. Strict Resume Check: If partial files exist on disk or download was previously in-progress
     let hasExistingMultiParts = false;
-    try {
-      hasExistingMultiParts = await ReactNativeBlobUtil.fs.exists(`${tempPrefix}0`);
-    } catch {}
+    for (let i = 0; i < 16; i++) {
+      try {
+        if (await ReactNativeBlobUtil.fs.exists(`${tempPrefix}${i}`)) {
+          hasExistingMultiParts = true;
+          break;
+        }
+      } catch {}
+    }
 
     let hasExistingSinglePart = false;
     try {
       hasExistingSinglePart = await ReactNativeBlobUtil.fs.exists(singlePartPath);
     } catch {}
 
+    const isResume = (download.downloadedSize || 0) > 0 || hasExistingMultiParts || hasExistingSinglePart;
     let totalSize = download.fileSize || 0;
 
-    // If existing single-stream part file exists, resume in single-stream mode! Never switch modes!
-    if (hasExistingSinglePart) {
-      console.log(`Resuming single-threaded download for ${download.fileName} from existing .part`);
-      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
-      return;
-    }
-
-    // If existing multi-thread chunks exist, resume in multi-threaded mode! Never switch modes!
-    if (hasExistingMultiParts) {
+    // If existing multi-thread chunks exist OR marked as multi-thread on resume:
+    if (hasExistingMultiParts || (download.isMultiThread && isResume)) {
       console.log(`Resuming multi-threaded download for ${download.fileName} from existing chunks`);
       const threadsToUse = download.threads || configuredThreads;
       this.updateDownloadState(id, { threads: threadsToUse, isMultiThread: true });
       await this._executeMultiThreadDownload(download, totalSize, threadsToUse, requestHeaders);
+      return;
+    }
+
+    // If existing single-stream part file exists OR marked as single-thread on resume:
+    if (hasExistingSinglePart || (!download.isMultiThread && isResume && totalSize > 0)) {
+      console.log(`Resuming single-threaded download for ${download.fileName} from existing .part`);
+      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
       return;
     }
 
@@ -297,8 +310,9 @@ class DownloadEngine {
     numThreads: number,
     requestHeaders: Record<string, string>,
   ): Promise<void> {
-    const { id, url, filePath } = download;
+    const { id, url } = download;
     const downloadDir = this.getDownloadDir();
+    const filePath = `${downloadDir}/TurboDownloader/${download.fileName}`;
     const tempPrefix = `${downloadDir}/TurboDownloader/.${id}_part_`;
 
     const chunkSize = Math.floor(totalSize / numThreads);
@@ -487,8 +501,9 @@ class DownloadEngine {
     knownTotalSize: number,
     requestHeaders: Record<string, string>,
   ): Promise<void> {
-    const { id, url, filePath } = download;
+    const { id, url } = download;
     const downloadDir = this.getDownloadDir();
+    const filePath = `${downloadDir}/TurboDownloader/${download.fileName}`;
     const tempPartPath = `${filePath}.part`;
     let isCancelled = false;
 
@@ -713,12 +728,18 @@ class DownloadEngine {
         } catch {}
       }
 
-      if (totalBytesOnDisk === 0 && download.filePath) {
+      if (totalBytesOnDisk === 0) {
         try {
-          const tp = `${download.filePath}.part`;
-          if (await ReactNativeBlobUtil.fs.exists(tp)) {
-            const stat = await ReactNativeBlobUtil.fs.stat(tp);
+          const currentSinglePart = `${downloadDir}/TurboDownloader/${download.fileName}.part`;
+          if (await ReactNativeBlobUtil.fs.exists(currentSinglePart)) {
+            const stat = await ReactNativeBlobUtil.fs.stat(currentSinglePart);
             totalBytesOnDisk = Number(stat.size);
+          } else if (download.filePath) {
+            const tp = `${download.filePath}.part`;
+            if (await ReactNativeBlobUtil.fs.exists(tp)) {
+              const stat = await ReactNativeBlobUtil.fs.stat(tp);
+              totalBytesOnDisk = Number(stat.size);
+            }
           }
         } catch {}
       }
