@@ -47,6 +47,7 @@ export function BrowserScreen() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [showBookmarks, setShowBookmarks] = useState(false);
   const [blockedCount, setBlockedCount] = useState(0);
+  const [detectedMedia, setDetectedMedia] = useState<{ url: string; title: string }[]>([]);
 
   const progressAnim = useRef(new Animated.Value(0)).current;
 
@@ -95,6 +96,9 @@ export function BrowserScreen() {
     setCanGoBack(navState.canGoBack);
     setCanGoForward(navState.canGoForward);
     if (navState.url) {
+      if (navState.url !== currentUrl) {
+        setDetectedMedia([]);
+      }
       setCurrentUrl(navState.url);
       if (!isUrlFocused) {
         setUrlBarText(navState.url);
@@ -114,10 +118,36 @@ export function BrowserScreen() {
     }
   };
 
+  const handleWebViewMessage = (event: any) => {
+    try {
+      const data = JSON.parse(event.nativeEvent.data);
+      if (data.type === 'MEDIA_DETECTED' && data.url) {
+        setDetectedMedia(prev => {
+          if (prev.some(m => m.url === data.url)) return prev;
+          return [...prev, { url: data.url, title: data.title || pageTitle || 'Video' }];
+        });
+      }
+    } catch (e) {}
+  };
+
   const handleShouldStartLoad = (event: any): boolean => {
     const { url } = event;
+    if (!url) return false;
 
-    // Check if URL should be blocked (ads)
+    const lower = url.toLowerCase();
+    // Block rogue schemes commonly abused by ad networks
+    if (
+      lower.startsWith('itms-app') ||
+      lower.startsWith('market:') ||
+      lower.startsWith('intent:') ||
+      lower.startsWith('tel:') ||
+      lower.startsWith('sms:') ||
+      lower.startsWith('mailto:')
+    ) {
+      return false;
+    }
+
+    // Check if URL should be blocked (ads, popunders, redirects)
     if (settings.adBlockEnabled && shouldBlockUrl(url)) {
       setBlockedCount(prev => prev + 1);
       return false;
@@ -310,16 +340,28 @@ export function BrowserScreen() {
         style={styles.webview}
         onNavigationStateChange={handleNavigationChange}
         onShouldStartLoadWithRequest={handleShouldStartLoad}
+        onMessage={handleWebViewMessage}
         onLoadStart={() => setIsLoading(true)}
         onLoadEnd={() => setIsLoading(false)}
         onLoadProgress={({ nativeEvent }) => setProgress(nativeEvent.progress)}
-        injectedJavaScript={injectedJS}
+        setSupportMultipleWindows={false}
+        javaScriptCanOpenWindowsAutomatically={false}
         injectedJavaScriptBeforeContentLoaded={`
-          var style = document.createElement('style');
-          style.textContent = \`${injectedCSS.replace(/`/g, '\\`')}\`;
-          document.head.appendChild(style);
+          ${injectedJS}
+          try {
+            var style = document.createElement('style');
+            style.textContent = \`${injectedCSS.replace(/`/g, '\\`')}\`;
+            if (document.head) {
+              document.head.appendChild(style);
+            } else {
+              document.addEventListener('DOMContentLoaded', function() {
+                if (document.head) document.head.appendChild(style);
+              });
+            }
+          } catch(e) {}
           true;
         `}
+        injectedJavaScript={injectedJS}
         allowsBackForwardNavigationGestures
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
@@ -328,12 +370,43 @@ export function BrowserScreen() {
         startInLoadingState
         decelerationRate="normal"
         sharedCookiesEnabled
+        userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
         renderLoading={() => (
           <View style={styles.loadingOverlay}>
             <ActivityIndicator size="large" color={Colors.primary} />
           </View>
         )}
       />
+
+      {/* IDM-Style Detected Media Sniffer Float */}
+      {detectedMedia.length > 0 && (
+        <View style={styles.mediaSnifferBar}>
+          <TouchableOpacity
+            style={styles.mediaSnifferBtn}
+            activeOpacity={0.85}
+            onPress={() => {
+              const latest = detectedMedia[detectedMedia.length - 1];
+              setPendingDownloadUrl(latest.url);
+              setShowDownloadModal(true);
+            }}
+          >
+            <View style={styles.mediaSnifferIconWrap}>
+              <Text style={styles.mediaSnifferIcon}>⚡</Text>
+            </View>
+            <View style={styles.mediaSnifferTextWrap}>
+              <Text style={styles.mediaSnifferTitle} numberOfLines={1}>
+                {detectedMedia[detectedMedia.length - 1].title || 'Video Detected!'}
+              </Text>
+              <Text style={styles.mediaSnifferSubtitle} numberOfLines={1}>
+                ⚡ {detectedMedia.length} high-speed stream{detectedMedia.length > 1 ? 's' : ''} captured · Tap to Download
+              </Text>
+            </View>
+            <View style={styles.mediaSnifferAction}>
+              <Text style={styles.mediaSnifferActionText}>Download</Text>
+            </View>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {/* Bottom Toolbar */}
       <View style={styles.bottomToolbar}>
@@ -586,5 +659,62 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '600',
     color: Colors.primary,
+  },
+  mediaSnifferBar: {
+    position: 'absolute',
+    bottom: 60,
+    left: 12,
+    right: 12,
+    zIndex: 99,
+  },
+  mediaSnifferBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#131127',
+    borderRadius: 14,
+    padding: 10,
+    borderWidth: 1.5,
+    borderColor: Colors.accent,
+    shadowColor: Colors.accent,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5,
+    shadowRadius: 10,
+    elevation: 10,
+  },
+  mediaSnifferIconWrap: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: 'rgba(0, 242, 254, 0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+  mediaSnifferIcon: {
+    fontSize: 20,
+  },
+  mediaSnifferTextWrap: {
+    flex: 1,
+  },
+  mediaSnifferTitle: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  mediaSnifferSubtitle: {
+    color: Colors.accent,
+    fontSize: 11,
+    marginTop: 2,
+  },
+  mediaSnifferAction: {
+    backgroundColor: Colors.primary,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 8,
+  },
+  mediaSnifferActionText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '700',
   },
 });

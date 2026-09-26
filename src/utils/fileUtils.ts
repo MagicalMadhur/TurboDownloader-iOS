@@ -143,6 +143,14 @@ export function getCategoryColor(category: FileCategory): string {
 
 // Check if URL looks like a downloadable file
 export function isDownloadableUrl(url: string): boolean {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+
+  // Exclude plain web pages without download query
+  if (lower.endsWith('.html') || lower.endsWith('.htm')) {
+    return false;
+  }
+
   const ext = getFileExtension(url);
   const downloadableExtensions = [
     ...FILE_EXTENSIONS.video,
@@ -150,9 +158,27 @@ export function isDownloadableUrl(url: string): boolean {
     ...FILE_EXTENSIONS.document,
     ...FILE_EXTENSIONS.image,
     ...FILE_EXTENSIONS.archive,
-    'apk', 'ipa', 'exe', 'msi', 'deb', 'rpm', 'bin', 'dat',
+    'apk', 'ipa', 'exe', 'msi', 'deb', 'rpm', 'bin', 'dat', 'iso', 'torrent',
   ];
-  return downloadableExtensions.includes(ext);
+  if (ext && downloadableExtensions.includes(ext)) {
+    return true;
+  }
+
+  // Common file hosting and download server URL patterns
+  if (
+    lower.includes('export=download') ||
+    lower.includes('dl=1') ||
+    lower.includes('download=true') ||
+    lower.includes('download=1') ||
+    lower.includes('response-content-disposition=attachment') ||
+    (lower.includes('/api/file/') && lower.includes('download')) ||
+    (lower.includes('gofile.io/download') && !lower.endsWith('.html')) ||
+    (lower.includes('pixeldrain.com/api/file/') && lower.includes('download'))
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 // Validate URL

@@ -11,6 +11,33 @@ import {
 export type DownloadEventCallback = (download: DownloadItem) => void;
 export type DownloadListCallback = (downloads: DownloadItem[]) => void;
 
+export const SAFARI_USER_AGENT =
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+
+function getRefererFromUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.protocol}//${parsed.host}/`;
+  } catch {
+    return '';
+  }
+}
+
+function parseContentDispositionFileName(headerValue?: string | null): string | null {
+  if (!headerValue) return null;
+  const utf8Match = headerValue.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match && utf8Match[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {}
+  }
+  const match = headerValue.match(/filename=["']?([^"';]+)["']?/i);
+  if (match && match[1]) {
+    return decodeURIComponent(match[1].trim());
+  }
+  return null;
+}
+
 class DownloadEngine {
   private activeDownloads: Map<string, any> = new Map();
   private downloadQueue: string[] = [];
@@ -136,10 +163,23 @@ class DownloadEngine {
     this.speedTrackers.set(id, { lastBytes: 0, lastTime: Date.now() });
 
     try {
-      // First, try to get file size with a HEAD request
+      const referer = headers?.['Referer'] || headers?.['referer'] || getRefererFromUrl(url);
+      const requestHeaders: Record<string, string> = {
+        'User-Agent': SAFARI_USER_AGENT,
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        ...(referer ? { 'Referer': referer } : {}),
+        ...headers,
+      };
+
+      // First, try to get file size & metadata with a HEAD request
       let totalSize = 0;
       try {
-        const headResponse = await fetch(url, { method: 'HEAD', headers });
+        const headResponse = await fetch(url, {
+          method: 'HEAD',
+          headers: requestHeaders,
+        });
         const contentLength = headResponse.headers.get('content-length');
         if (contentLength) {
           totalSize = parseInt(contentLength, 10);
@@ -149,15 +189,19 @@ class DownloadEngine {
         if (contentType) {
           this.updateDownloadState(id, { mimeType: contentType });
         }
+        const disposition = headResponse.headers.get('content-disposition');
+        const dispositionName = parseContentDispositionFileName(disposition);
+        if (dispositionName) {
+          this.updateDownloadState(id, { fileName: sanitizeFileName(dispositionName) });
+        }
       } catch (e) {
-        // HEAD request failed, continue with download
-        console.log('HEAD request failed, continuing...', e);
+        console.log('HEAD request skipped or failed, continuing with direct GET...', e);
       }
 
       const config: any = {
         fileCache: true,
         path: filePath,
-        // iOS background session
+        followRedirect: true,
         IOSBackgroundTask: true,
         indicator: true,
         overwrite: true,
@@ -167,11 +211,6 @@ class DownloadEngine {
         config.IOSBackgroundTask = true;
       }
 
-      const requestHeaders: Record<string, string> = {
-        'User-Agent': 'TurboDownloader/1.0',
-        ...headers,
-      };
-
       const task = ReactNativeBlobUtil.config(config)
         .fetch('GET', url, requestHeaders)
         .progress({ count: 10, interval: 200 }, (received: number, total: number) => {
@@ -180,7 +219,7 @@ class DownloadEngine {
 
           let speed = 0;
           if (tracker) {
-            const timeDiff = (now - tracker.lastTime) / 1000; // seconds
+            const timeDiff = (now - tracker.lastTime) / 1000;
             const bytesDiff = received - tracker.lastBytes;
             if (timeDiff > 0) {
               speed = bytesDiff / timeDiff;
@@ -203,17 +242,78 @@ class DownloadEngine {
 
       const result = await task;
       const info = result.info();
+      const httpStatus = info.status;
 
-      // Download complete
+      // 1. Verify HTTP Status Code
+      if (httpStatus >= 400) {
+        try {
+          await ReactNativeBlobUtil.fs.unlink(result.path());
+        } catch (e) {}
+
+        let msg = `Server error HTTP ${httpStatus}`;
+        if (httpStatus === 403) msg = '403 Forbidden: Download link expired or blocked by anti-bot. Please generate a fresh link in the built-in browser.';
+        if (httpStatus === 404) msg = '404 Not Found: The file was not found on the download server.';
+        if (httpStatus === 401) msg = '401 Unauthorized: This download link requires a login session.';
+        throw new Error(msg);
+      }
+
+      // 2. Verify downloaded file on disk
       const stat = await ReactNativeBlobUtil.fs.stat(result.path());
+      const downloadedBytes = Number(stat.size);
+
+      // 3. Detect HTML error/captcha traps (e.g. 146-byte error bodies)
+      if (downloadedBytes < 4096) {
+        try {
+          const content = await ReactNativeBlobUtil.fs.readFile(result.path(), 'utf8');
+          const lower = content.toLowerCase();
+          if (
+            lower.includes('<!doctype html') ||
+            lower.includes('<html') ||
+            lower.includes('<title>403') ||
+            lower.includes('cloudflare') ||
+            lower.includes('access denied') ||
+            lower.includes('checking your browser')
+          ) {
+            try {
+              await ReactNativeBlobUtil.fs.unlink(result.path());
+            } catch (e) {}
+
+            throw new Error(
+              'The download link returned a webpage instead of the file (likely an expired or Cloudflare-protected link). Please open the movie website in the built-in browser to start the direct download.'
+            );
+          }
+        } catch (readErr: any) {
+          if (readErr.message?.includes('webpage instead of the file')) {
+            throw readErr;
+          }
+        }
+      }
+
+      // 4. Check Content-Disposition for server-provided filename
+      let finalPath = result.path();
+      let finalName = download.fileName;
+      const respHeaders = info.headers || {};
+      const cd = respHeaders['content-disposition'] || respHeaders['Content-Disposition'];
+      const serverFileName = parseContentDispositionFileName(cd);
+      if (serverFileName) {
+        const sanitized = sanitizeFileName(serverFileName);
+        const downloadDir = this.getDownloadDir();
+        const newPath = `${downloadDir}/TurboDownloader/${sanitized}`;
+        try {
+          await ReactNativeBlobUtil.fs.mv(result.path(), newPath);
+          finalPath = newPath;
+          finalName = sanitized;
+        } catch (e) {}
+      }
 
       this.updateDownloadState(id, {
         status: 'completed',
         progress: 1,
         speed: 0,
-        downloadedSize: Number(stat.size),
-        fileSize: Number(stat.size),
-        filePath: result.path(),
+        fileName: finalName,
+        downloadedSize: downloadedBytes,
+        fileSize: downloadedBytes,
+        filePath: finalPath,
         completedAt: new Date().toISOString(),
       });
 
