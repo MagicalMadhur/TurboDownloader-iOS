@@ -212,7 +212,7 @@ export function BrowserScreen() {
 
   const handleDownload = async (url: string, fileName?: string) => {
     try {
-      await startDownload(url, fileName);
+      startDownload(url, fileName);
       // Wait for modal dismiss animation to complete before showing Alert to prevent iOS presentation crash
       setTimeout(() => {
         Alert.alert('Download Started! ⚡', `${fileName || 'File'} has been added to your downloads.`);

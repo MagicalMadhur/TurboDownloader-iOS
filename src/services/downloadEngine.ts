@@ -153,7 +153,9 @@ class DownloadEngine {
 
     // Try to start immediately or queue
     if (this.activeDownloads.size < this.maxConcurrent) {
-      await this._executeDownload(download, headers);
+      this._executeDownload(download, headers).catch(err => {
+        console.error('Download execution error:', err);
+      });
     } else {
       this.downloadQueue.push(id);
     }
@@ -184,53 +186,59 @@ class DownloadEngine {
     };
 
     let totalSize = download.fileSize || 0;
-    let rangeSupported = false;
+    let rangeSupported = totalSize > 2 * 1024 * 1024;
     let serverFileName: string | null = null;
 
-    // Probe server for range support & file size
-    try {
-      const headResponse = await fetch(url, {
-        method: 'HEAD',
-        headers: requestHeaders,
-      });
+    // Only probe if size is unknown or range is unconfirmed (skips probe on resume for instant start!)
+    if (totalSize <= 0) {
+      const probeController = new AbortController();
+      const probeTimer = setTimeout(() => probeController.abort(), 3500);
 
-      const acceptRanges = headResponse.headers.get('accept-ranges');
-      const contentLength = headResponse.headers.get('content-length');
-      const disposition = headResponse.headers.get('content-disposition');
-      serverFileName = parseContentDispositionFileName(disposition);
-
-      if (contentLength) {
-        totalSize = parseInt(contentLength, 10);
-        this.updateDownloadState(id, { fileSize: totalSize });
-      }
-
-      const contentType = headResponse.headers.get('content-type');
-      if (contentType) {
-        this.updateDownloadState(id, { mimeType: contentType });
-      }
-
-      if (serverFileName) {
-        this.updateDownloadState(id, { fileName: sanitizeFileName(serverFileName) });
-      }
-
-      if (acceptRanges === 'bytes' && totalSize > 2 * 1024 * 1024) {
-        rangeSupported = true;
-      }
-    } catch (e) {
-      console.log('HEAD request probe skipped or failed, continuing with Range test...', e);
-    }
-
-    // If server range is unconfirmed and file is > 2MB (or already known size), test range with quick 1-byte GET
-    if (!rangeSupported && totalSize > 2 * 1024 * 1024) {
       try {
-        const testRes = await fetch(url, {
+        // Fast 2-byte Range GET request: avoids Cloudflare/Nginx HEAD blocks and never hangs
+        const probeRes = await fetch(url, {
           method: 'GET',
-          headers: { ...requestHeaders, 'Range': 'bytes=0-1' },
+          headers: {
+            ...requestHeaders,
+            'Range': 'bytes=0-1',
+          },
+          signal: probeController.signal,
         });
-        if (testRes.status === 206) {
+        clearTimeout(probeTimer);
+
+        const status = probeRes.status;
+        const contentRange = probeRes.headers.get('content-range');
+        const contentLength = probeRes.headers.get('content-length');
+        const disposition = probeRes.headers.get('content-disposition');
+        const contentType = probeRes.headers.get('content-type');
+        serverFileName = parseContentDispositionFileName(disposition);
+
+        if (status === 206 && contentRange) {
           rangeSupported = true;
+          const match = contentRange.match(/\/(\d+)/);
+          if (match && match[1]) {
+            totalSize = parseInt(match[1], 10);
+            this.updateDownloadState(id, { fileSize: totalSize });
+          }
+        } else if (contentLength) {
+          totalSize = parseInt(contentLength, 10);
+          this.updateDownloadState(id, { fileSize: totalSize });
+          if (probeRes.headers.get('accept-ranges') === 'bytes') {
+            rangeSupported = true;
+          }
         }
-      } catch {}
+
+        if (contentType) {
+          this.updateDownloadState(id, { mimeType: contentType });
+        }
+
+        if (serverFileName) {
+          this.updateDownloadState(id, { fileName: sanitizeFileName(serverFileName) });
+        }
+      } catch (err: any) {
+        clearTimeout(probeTimer);
+        console.log('Fast range probe finished or timed out, proceeding:', err.message);
+      }
     }
 
     // If server supports HTTP Range and file is > 2MB, run Multi-Threaded Download (Velocity style!)
@@ -693,12 +701,13 @@ class DownloadEngine {
     if (!download) return;
 
     if (download.status === 'paused' || download.status === 'failed') {
+      this.updateDownloadState(id, { status: 'queued', error: undefined });
       if (this.activeDownloads.size < this.maxConcurrent) {
-        this.updateDownloadState(id, { status: 'queued', error: undefined });
-        await this._executeDownload(download);
+        this._executeDownload(download).catch(err => {
+          console.error('Resume download execution error:', err);
+        });
       } else {
         this.downloadQueue.push(id);
-        this.updateDownloadState(id, { status: 'queued', error: undefined });
       }
     }
   }
@@ -802,7 +811,9 @@ class DownloadEngine {
       if (nextId) {
         const download = this.downloads.find(d => d.id === nextId);
         if (download && download.status === 'queued') {
-          await this._executeDownload(download);
+          this._executeDownload(download).catch(err => {
+            console.error('Queue download execution error:', err);
+          });
         }
       }
     }
