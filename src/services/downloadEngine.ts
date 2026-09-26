@@ -189,19 +189,42 @@ class DownloadEngine {
 
     const downloadDir = this.getDownloadDir();
     const tempPrefix = `${downloadDir}/TurboDownloader/.${id}_part_`;
+    const singlePartPath = `${download.filePath}.part`;
 
-    // Check if multi-thread chunk files already exist on disk from a previous run
-    let hasExistingParts = false;
+    // 1. Strict Resume Check: If partial files already exist on disk, RESUME in their native mode!
+    let hasExistingMultiParts = false;
     try {
-      hasExistingParts = await ReactNativeBlobUtil.fs.exists(`${tempPrefix}0`);
+      hasExistingMultiParts = await ReactNativeBlobUtil.fs.exists(`${tempPrefix}0`);
+    } catch {}
+
+    let hasExistingSinglePart = false;
+    try {
+      hasExistingSinglePart = await ReactNativeBlobUtil.fs.exists(singlePartPath);
     } catch {}
 
     let totalSize = download.fileSize || 0;
-    let rangeSupported = (download.isMultiThread ?? false) || hasExistingParts || totalSize > 2 * 1024 * 1024;
+
+    // If existing single-stream part file exists, resume in single-stream mode! Never switch modes!
+    if (hasExistingSinglePart) {
+      console.log(`Resuming single-threaded download for ${download.fileName} from existing .part`);
+      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
+      return;
+    }
+
+    // If existing multi-thread chunks exist, resume in multi-threaded mode! Never switch modes!
+    if (hasExistingMultiParts) {
+      console.log(`Resuming multi-threaded download for ${download.fileName} from existing chunks`);
+      const threadsToUse = download.threads || configuredThreads;
+      this.updateDownloadState(id, { threads: threadsToUse, isMultiThread: true });
+      await this._executeMultiThreadDownload(download, totalSize, threadsToUse, requestHeaders);
+      return;
+    }
+
+    // 2. Fresh download: probe to check size and Range support
+    let rangeSupported = (download.isMultiThread ?? false) || totalSize > 2 * 1024 * 1024;
     let serverFileName: string | null = null;
 
-    // Only probe if size is unknown and not resuming multi-part (skips probe on resume for instant start!)
-    if (totalSize <= 0 && !hasExistingParts) {
+    if (totalSize <= 0) {
       try {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 6000);
@@ -231,7 +254,6 @@ class DownloadEngine {
           }
         } else if (contentLength) {
           totalSize = parseInt(contentLength, 10);
-          // If file is > 2MB, assume Range is supported (almost all media CDNs support it)
           if (totalSize > 2 * 1024 * 1024 || probeRes.headers.get('accept-ranges') === 'bytes') {
             rangeSupported = true;
           }
@@ -260,8 +282,8 @@ class DownloadEngine {
 
     const threadsToUse = download.threads || configuredThreads;
 
-    // Run Multi-Threaded Download if range supported & size > 2MB, OR if part chunks already exist
-    if ((rangeSupported && totalSize > 2 * 1024 * 1024) || hasExistingParts) {
+    // Run Multi-Threaded Download if range supported & size > 2MB
+    if (rangeSupported && totalSize > 2 * 1024 * 1024) {
       this.updateDownloadState(id, { threads: threadsToUse, isMultiThread: true });
       await this._executeMultiThreadDownload(download, totalSize, threadsToUse, requestHeaders);
     } else {
@@ -380,9 +402,10 @@ class DownloadEngine {
 
         const task = ReactNativeBlobUtil.config(config)
           .fetch('GET', url, partHeaders)
-          .progress({ count: 10, interval: 250 }, (received: number) => {
+          .progress({ count: 10, interval: 250 }, (received: any) => {
             if (isCancelled) return;
-            partBytes[i] = existingPartBytes + Math.max(0, received);
+            const bytesNum = typeof received === 'string' ? parseInt(received, 10) || 0 : Math.max(0, received || 0);
+            partBytes[i] = existingPartBytes + bytesNum;
             handleProgressTick();
           });
 
@@ -495,13 +518,24 @@ class DownloadEngine {
         overwrite: !isResuming, // append directly to tempPartPath when resuming!
       };
 
+      if (isResuming && knownTotalSize > 0) {
+        this.updateDownloadState(id, {
+          downloadedSize: existingBytes,
+          fileSize: knownTotalSize,
+          progress: Math.min(1, existingBytes / knownTotalSize),
+          status: 'downloading',
+        });
+      }
+
       const task = ReactNativeBlobUtil.config(config)
         .fetch('GET', url, fetchHeaders)
-        .progress({ count: 10, interval: 250 }, (received: number, total: number) => {
+        .progress({ count: 10, interval: 250 }, (received: any, total: any) => {
           if (isCancelled) return;
-          const currentReceived = existingBytes + Math.max(0, received);
-          const actualTotal = (isFinite(total) && total > 0)
-            ? (isResuming ? existingBytes + total : total)
+          const bytesNum = typeof received === 'string' ? parseInt(received, 10) || 0 : Math.max(0, received || 0);
+          const totalNum = typeof total === 'string' ? parseInt(total, 10) || 0 : (total || 0);
+          const currentReceived = existingBytes + bytesNum;
+          const actualTotal = (isFinite(totalNum) && totalNum > 0)
+            ? (isResuming ? existingBytes + totalNum : totalNum)
             : (knownTotalSize > 0 ? knownTotalSize : 0);
 
           const now = Date.now();

@@ -42,6 +42,11 @@
 		<string>fetch</string>
 		<string>processing</string>
 	</array>
+	<!-- Enable iOS Live Activities & Dynamic Island -->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
+	<true/>
 	<!-- Allow file sharing via iTunes/Finder -->
 	<key>UIFileSharingEnabled</key>
 	<true/>
