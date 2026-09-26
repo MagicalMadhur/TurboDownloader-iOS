@@ -271,9 +271,26 @@ export function normalizeUrl(rawUrl: string): string {
     url = 'https://' + url;
   }
   try {
-    return encodeURI(decodeURI(url));
+    let clean = encodeURI(decodeURI(url));
+    // iOS [NSURL URLWithString:] returns nil if path/query has unencoded brackets, pipes, etc.
+    clean = clean
+      .replace(/\[/g, '%5B')
+      .replace(/\]/g, '%5D')
+      .replace(/\|/g, '%7C')
+      .replace(/\^/g, '%5E')
+      .replace(/\\/g, '%5C')
+      .replace(/"/g, '%22')
+      .replace(/{/g, '%7B')
+      .replace(/}/g, '%7D');
+    return clean;
   } catch {
-    return url.replace(/ /g, '%20');
+    return url
+      .replace(/ /g, '%20')
+      .replace(/\[/g, '%5B')
+      .replace(/\]/g, '%5D')
+      .replace(/\|/g, '%7C')
+      .replace(/\^/g, '%5E')
+      .replace(/\\/g, '%5C');
   }
 }
 

@@ -23,6 +23,8 @@ export interface DownloadItem {
   createdAt: string;
   completedAt?: string;
   resumable: boolean;
+  threads?: number;
+  isMultiThread?: boolean;
 }
 
 export interface AppSettings {

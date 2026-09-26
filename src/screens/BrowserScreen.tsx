@@ -17,7 +17,7 @@ import { WebView } from 'react-native-webview';
 import { Colors, Shadows } from '../theme';
 import { useDownloads } from '../context/DownloadContext';
 import { storage, Bookmark } from '../services/storage';
-import { isValidUrl, isDownloadableUrl } from '../utils/fileUtils';
+import { isValidUrl, isDownloadableUrl, normalizeUrl } from '../utils/fileUtils';
 import { AD_HIDE_CSS, AD_BLOCK_JS, shouldBlockUrl } from '../utils/adBlocker';
 import { AddDownloadModal } from '../components/AddDownloadModal';
 
@@ -48,8 +48,19 @@ export function BrowserScreen() {
   const [showBookmarks, setShowBookmarks] = useState(false);
   const [blockedCount, setBlockedCount] = useState(0);
   const [detectedMedia, setDetectedMedia] = useState<{ url: string; title: string }[]>([]);
+  const [downloadToast, setDownloadToast] = useState<string | null>(null);
 
   const progressAnim = useRef(new Animated.Value(0)).current;
+  const toastAnim = useRef(new Animated.Value(0)).current;
+
+  const showToast = (message: string) => {
+    setDownloadToast(message);
+    Animated.sequence([
+      Animated.timing(toastAnim, { toValue: 1, duration: 250, useNativeDriver: true }),
+      Animated.delay(2600),
+      Animated.timing(toastAnim, { toValue: 0, duration: 250, useNativeDriver: true }),
+    ]).start(() => setDownloadToast(null));
+  };
 
   useEffect(() => {
     loadBookmarks();
@@ -122,12 +133,14 @@ export function BrowserScreen() {
     try {
       const data = JSON.parse(event.nativeEvent.data);
       if (data.type === 'MEDIA_DETECTED' && data.url) {
+        const safeUrl = normalizeUrl(data.url);
         setDetectedMedia(prev => {
-          if (prev.some(m => m.url === data.url)) return prev;
-          return [...prev, { url: data.url, title: data.title || pageTitle || 'Video' }];
+          if (prev.some(m => m.url === safeUrl)) return prev;
+          return [...prev, { url: safeUrl, title: data.title || pageTitle || 'Video' }];
         });
       } else if (data.type === 'DOWNLOAD_CLICKED' && data.url) {
-        setPendingDownloadUrl(data.url);
+        const safeUrl = normalizeUrl(data.url);
+        setPendingDownloadUrl(safeUrl);
         setShowDownloadModal(true);
       }
     } catch (e) {}
@@ -159,7 +172,8 @@ export function BrowserScreen() {
 
     // 3. Check if it's a downloadable file
     if (isDownloadableUrl(url)) {
-      setPendingDownloadUrl(url);
+      const safeUrl = normalizeUrl(url);
+      setPendingDownloadUrl(safeUrl);
       setShowDownloadModal(true);
       return false;
     }
@@ -212,15 +226,11 @@ export function BrowserScreen() {
 
   const handleDownload = async (url: string, fileName?: string) => {
     try {
-      startDownload(url, fileName);
-      // Wait for modal dismiss animation to complete before showing Alert to prevent iOS presentation crash
-      setTimeout(() => {
-        Alert.alert('Download Started! ⚡', `${fileName || 'File'} has been added to your downloads.`);
-      }, 450);
+      const safeUrl = normalizeUrl(url);
+      startDownload(safeUrl, fileName);
+      showToast(`⚡ Started: ${fileName || 'File'}`);
     } catch (err: any) {
-      setTimeout(() => {
-        Alert.alert('Download Error', err?.message || 'Could not start download');
-      }, 450);
+      showToast(`❌ ${err?.message || 'Could not start download'}`);
     }
   };
 
@@ -400,6 +410,16 @@ export function BrowserScreen() {
         onLoadStart={() => setIsLoading(true)}
         onLoadEnd={() => setIsLoading(false)}
         onLoadProgress={({ nativeEvent }) => setProgress(nativeEvent.progress)}
+        onFileDownload={({ nativeEvent }) => {
+          const downloadUrl = nativeEvent?.downloadUrl;
+          if (downloadUrl) {
+            const safeUrl = normalizeUrl(downloadUrl);
+            setPendingDownloadUrl(safeUrl);
+            setShowDownloadModal(true);
+          }
+        }}
+        onError={e => console.log('WebView load error:', e.nativeEvent?.description)}
+        onHttpError={e => console.log('WebView HTTP error:', e.nativeEvent?.statusCode)}
         setSupportMultipleWindows={false}
         javaScriptCanOpenWindowsAutomatically={false}
         injectedJavaScriptBeforeContentLoaded={`
@@ -505,6 +525,13 @@ export function BrowserScreen() {
           <Text style={styles.bottomBtnText}>Reload</Text>
         </TouchableOpacity>
       </View>
+
+      {/* Floating In-App Toast */}
+      {downloadToast && (
+        <Animated.View style={[styles.toastContainer, { opacity: toastAnim, transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [20, 0] }) }] }]}>
+          <Text style={styles.toastText} numberOfLines={1}>{downloadToast}</Text>
+        </Animated.View>
+      )}
 
       {/* Download modal */}
       <AddDownloadModal
@@ -773,6 +800,29 @@ const styles = StyleSheet.create({
   mediaSnifferActionText: {
     color: '#FFFFFF',
     fontSize: 12,
+    fontWeight: '700',
+  },
+  toastContainer: {
+    position: 'absolute',
+    top: 60,
+    alignSelf: 'center',
+    backgroundColor: '#0F172A',
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: Colors.accent,
+    shadowColor: Colors.accent,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+    elevation: 12,
+    zIndex: 9999,
+    maxWidth: '90%',
+  },
+  toastText: {
+    color: '#FFFFFF',
+    fontSize: 13,
     fontWeight: '700',
   },
 });

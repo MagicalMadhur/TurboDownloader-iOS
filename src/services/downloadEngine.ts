@@ -127,10 +127,12 @@ class DownloadEngine {
 
     // Ensure download directory exists
     const dirPath = `${downloadDir}/TurboDownloader`;
-    const exists = await ReactNativeBlobUtil.fs.isDir(dirPath);
-    if (!exists) {
-      await ReactNativeBlobUtil.fs.mkdir(dirPath);
-    }
+    try {
+      const exists = await ReactNativeBlobUtil.fs.exists(dirPath);
+      if (!exists) {
+        await ReactNativeBlobUtil.fs.mkdir(dirPath);
+      }
+    } catch {}
 
     const download: DownloadItem = {
       id,
@@ -185,26 +187,34 @@ class DownloadEngine {
       ...headers,
     };
 
+    const downloadDir = this.getDownloadDir();
+    const tempPrefix = `${downloadDir}/TurboDownloader/.${id}_part_`;
+
+    // Check if multi-thread chunk files already exist on disk from a previous run
+    let hasExistingParts = false;
+    try {
+      hasExistingParts = await ReactNativeBlobUtil.fs.exists(`${tempPrefix}0`);
+    } catch {}
+
     let totalSize = download.fileSize || 0;
-    let rangeSupported = totalSize > 2 * 1024 * 1024;
+    let rangeSupported = (download.isMultiThread ?? false) || hasExistingParts || totalSize > 2 * 1024 * 1024;
     let serverFileName: string | null = null;
 
-    // Only probe if size is unknown or range is unconfirmed (skips probe on resume for instant start!)
-    if (totalSize <= 0) {
-      const probeController = new AbortController();
-      const probeTimer = setTimeout(() => probeController.abort(), 3500);
-
+    // Only probe if size is unknown and not resuming multi-part (skips probe on resume for instant start!)
+    if (totalSize <= 0 && !hasExistingParts) {
       try {
-        // Fast 2-byte Range GET request: avoids Cloudflare/Nginx HEAD blocks and never hangs
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 6000);
+
         const probeRes = await fetch(url, {
           method: 'GET',
           headers: {
             ...requestHeaders,
             'Range': 'bytes=0-1',
           },
-          signal: probeController.signal,
+          signal: controller.signal,
         });
-        clearTimeout(probeTimer);
+        clearTimeout(timeoutId);
 
         const status = probeRes.status;
         const contentRange = probeRes.headers.get('content-range');
@@ -218,12 +228,11 @@ class DownloadEngine {
           const match = contentRange.match(/\/(\d+)/);
           if (match && match[1]) {
             totalSize = parseInt(match[1], 10);
-            this.updateDownloadState(id, { fileSize: totalSize });
           }
         } else if (contentLength) {
           totalSize = parseInt(contentLength, 10);
-          this.updateDownloadState(id, { fileSize: totalSize });
-          if (probeRes.headers.get('accept-ranges') === 'bytes') {
+          // If file is > 2MB, assume Range is supported (almost all media CDNs support it)
+          if (totalSize > 2 * 1024 * 1024 || probeRes.headers.get('accept-ranges') === 'bytes') {
             rangeSupported = true;
           }
         }
@@ -235,18 +244,27 @@ class DownloadEngine {
         if (serverFileName) {
           this.updateDownloadState(id, { fileName: sanitizeFileName(serverFileName) });
         }
+
+        if (totalSize > 0) {
+          this.updateDownloadState(id, {
+            fileSize: totalSize,
+            isMultiThread: rangeSupported,
+            threads: configuredThreads,
+          });
+          await this._persistState();
+        }
       } catch (err: any) {
-        clearTimeout(probeTimer);
-        console.log('Fast range probe finished or timed out, proceeding:', err.message);
+        console.log('Probe finished with notice:', err.message);
       }
     }
 
-    // If server supports HTTP Range and file is > 2MB, run Multi-Threaded Download (Velocity style!)
-    if (rangeSupported && totalSize > 2 * 1024 * 1024) {
-      console.log(`Starting/Resuming multi-threaded download for ${download.fileName} with ${configuredThreads} threads!`);
-      await this._executeMultiThreadDownload(download, totalSize, configuredThreads, requestHeaders);
+    const threadsToUse = download.threads || configuredThreads;
+
+    // Run Multi-Threaded Download if range supported & size > 2MB, OR if part chunks already exist
+    if ((rangeSupported && totalSize > 2 * 1024 * 1024) || hasExistingParts) {
+      this.updateDownloadState(id, { threads: threadsToUse, isMultiThread: true });
+      await this._executeMultiThreadDownload(download, totalSize, threadsToUse, requestHeaders);
     } else {
-      console.log(`Starting/Resuming single-threaded download for ${download.fileName}`);
       await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
     }
   }
@@ -343,70 +361,33 @@ class DownloadEngine {
           continue;
         }
 
-        if (existingPartBytes > 0) {
-          // Part is partially downloaded -> Resume remaining bytes!
-          partBytes[i] = existingPartBytes;
-          const resumeStart = start + existingPartBytes;
-          const resumePartPath = `${partPath}_resume`;
+        const isResumingPart = existingPartBytes > 0;
+        partBytes[i] = existingPartBytes;
+        const partStart = start + existingPartBytes;
 
-          const config = {
-            fileCache: true,
-            path: resumePartPath,
-            followRedirect: true,
-            IOSBackgroundTask: true,
-            overwrite: true,
-          };
+        const config = {
+          fileCache: true,
+          path: partPath,
+          followRedirect: true,
+          IOSBackgroundTask: true,
+          overwrite: !isResumingPart, // overwrite: false enables native iOS [NSOutputStream initToFileAtPath:partPath append:YES]!
+        };
 
-          const partHeaders = {
-            ...requestHeaders,
-            'Range': `bytes=${resumeStart}-${end}`,
-          };
+        const partHeaders = {
+          ...requestHeaders,
+          'Range': `bytes=${partStart}-${end}`,
+        };
 
-          const task = ReactNativeBlobUtil.config(config)
-            .fetch('GET', url, partHeaders)
-            .progress({ count: 10, interval: 250 }, (received: number) => {
-              if (isCancelled) return;
-              partBytes[i] = existingPartBytes + Math.max(0, received);
-              handleProgressTick();
-            });
-
-          const resumePromise = task.then(async (res: any) => {
-            const info = res.info();
-            if (info.status >= 400) throw new Error(`HTTP ${info.status}`);
-            await ReactNativeBlobUtil.fs.appendFile(partPath, resumePartPath, 'uri');
-            try { await ReactNativeBlobUtil.fs.unlink(resumePartPath); } catch (e) {}
-            return res;
+        const task = ReactNativeBlobUtil.config(config)
+          .fetch('GET', url, partHeaders)
+          .progress({ count: 10, interval: 250 }, (received: number) => {
+            if (isCancelled) return;
+            partBytes[i] = existingPartBytes + Math.max(0, received);
+            handleProgressTick();
           });
 
-          tasks.push(task);
-          promises.push(resumePromise);
-        } else {
-          // Download fresh chunk
-          partBytes[i] = 0;
-          const config = {
-            fileCache: true,
-            path: partPath,
-            followRedirect: true,
-            IOSBackgroundTask: true,
-            overwrite: true,
-          };
-
-          const partHeaders = {
-            ...requestHeaders,
-            'Range': `bytes=${start}-${end}`,
-          };
-
-          const task = ReactNativeBlobUtil.config(config)
-            .fetch('GET', url, partHeaders)
-            .progress({ count: 10, interval: 250 }, (received: number) => {
-              if (isCancelled) return;
-              partBytes[i] = Math.max(0, received);
-              handleProgressTick();
-            });
-
-          tasks.push(task);
-          promises.push(task);
-        }
+        tasks.push(task);
+        promises.push(task);
       }
 
       // Initial progress update right upon starting/resuming
@@ -422,13 +403,22 @@ class DownloadEngine {
         }
       }
 
+      // Clean existing target file if any
+      try {
+        if (await ReactNativeBlobUtil.fs.exists(filePath)) {
+          await ReactNativeBlobUtil.fs.unlink(filePath);
+        }
+      } catch (e) {}
+
       // Concatenate parts natively using 'uri' encoding (zero JS memory overhead!)
       await ReactNativeBlobUtil.fs.cp(partPaths[0], filePath);
       try { await ReactNativeBlobUtil.fs.unlink(partPaths[0]); } catch (e) {}
 
       for (let i = 1; i < numThreads; i++) {
-        await ReactNativeBlobUtil.fs.appendFile(filePath, partPaths[i], 'uri');
-        try { await ReactNativeBlobUtil.fs.unlink(partPaths[i]); } catch (e) {}
+        if (await ReactNativeBlobUtil.fs.exists(partPaths[i])) {
+          await ReactNativeBlobUtil.fs.appendFile(filePath, partPaths[i], 'uri');
+          try { await ReactNativeBlobUtil.fs.unlink(partPaths[i]); } catch (e) {}
+        }
       }
 
       const stat = await ReactNativeBlobUtil.fs.stat(filePath);
@@ -450,22 +440,22 @@ class DownloadEngine {
       this._processQueue();
 
     } catch (err: any) {
-      if (isCancelled || err.message?.includes('cancel') || err.message?.includes('abort')) {
+      if (isCancelled || err.message?.includes('cancel') || err.message?.includes('abort') || err.message?.includes('canceled')) {
         // User PAUSED the download: KEEP all chunk files safe on disk so resume continues seamlessly!
         return;
       }
 
-      // Clean up temporary parts only on fatal unrecoverable errors
-      for (const p of partPaths) {
-        try {
-          if (await ReactNativeBlobUtil.fs.exists(p)) await ReactNativeBlobUtil.fs.unlink(p);
-          const pr = `${p}_resume`;
-          if (await ReactNativeBlobUtil.fs.exists(pr)) await ReactNativeBlobUtil.fs.unlink(pr);
-        } catch (e) {}
-      }
-
-      console.warn('Multi-part download error, falling back to single stream:', err.message);
-      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
+      console.warn('Multi-part download interrupted:', err.message);
+      // DO NOT delete parts if network dropped! Keep parts so resume picks them up!
+      this.updateDownloadState(id, {
+        status: 'failed',
+        speed: 0,
+        error: err.message || 'Download interrupted. Tap retry to resume.',
+      });
+      this.activeDownloads.delete(id);
+      this.speedTrackers.delete(id);
+      await this._persistState();
+      this._processQueue();
     }
   }
 
@@ -490,7 +480,6 @@ class DownloadEngine {
       } catch {}
 
       const isResuming = existingBytes > 0;
-      const fetchPath = isResuming ? `${tempPartPath}_resume` : tempPartPath;
       const fetchHeaders = { ...requestHeaders };
 
       if (isResuming) {
@@ -499,16 +488,12 @@ class DownloadEngine {
 
       const config: any = {
         fileCache: true,
-        path: fetchPath,
+        path: tempPartPath,
         followRedirect: true,
         IOSBackgroundTask: true,
         indicator: true,
-        overwrite: true,
+        overwrite: !isResuming, // append directly to tempPartPath when resuming!
       };
-
-      if (Platform.OS === 'ios') {
-        config.IOSBackgroundTask = true;
-      }
 
       const task = ReactNativeBlobUtil.config(config)
         .fetch('GET', url, fetchHeaders)
@@ -569,10 +554,6 @@ class DownloadEngine {
 
       // 1. Verify HTTP Status Code
       if (httpStatus >= 400) {
-        try {
-          await ReactNativeBlobUtil.fs.unlink(result.path());
-        } catch (e) {}
-
         let msg = `Server error HTTP ${httpStatus}`;
         if (httpStatus === 403) msg = '403 Forbidden: Download link expired or blocked by anti-bot. Please generate a fresh link in the built-in browser.';
         if (httpStatus === 404) msg = '404 Not Found: The file was not found on the download server.';
@@ -580,22 +561,19 @@ class DownloadEngine {
         throw new Error(msg);
       }
 
-      // If resuming and server honored Range (HTTP 206), append the resume piece to main part
-      if (isResuming && httpStatus === 206) {
-        await ReactNativeBlobUtil.fs.appendFile(tempPartPath, fetchPath, 'uri');
-        try { await ReactNativeBlobUtil.fs.unlink(fetchPath); } catch (e) {}
-      } else if (isResuming && httpStatus === 200) {
-        // Server ignored Range and re-sent full file
-        await ReactNativeBlobUtil.fs.mv(fetchPath, tempPartPath);
-      }
+      // Rename final part to complete target path
+      try {
+        if (await ReactNativeBlobUtil.fs.exists(filePath)) {
+          await ReactNativeBlobUtil.fs.unlink(filePath);
+        }
+      } catch (e) {}
 
-      // 2. Rename final part to complete target path
       await ReactNativeBlobUtil.fs.mv(tempPartPath, filePath);
 
       const stat = await ReactNativeBlobUtil.fs.stat(filePath);
       const downloadedBytes = Number(stat.size);
 
-      // 3. Detect HTML error/captcha traps (e.g. 146-byte error bodies)
+      // Detect HTML error/captcha traps (e.g. 146-byte error bodies)
       if (downloadedBytes < 4096) {
         try {
           const content = await ReactNativeBlobUtil.fs.readFile(filePath, 'utf8');
@@ -621,7 +599,7 @@ class DownloadEngine {
         }
       }
 
-      // 4. Check Content-Disposition for server-provided filename
+      // Check Content-Disposition for server-provided filename
       let finalPath = filePath;
       let finalName = download.fileName;
       const respHeaders = info.headers || {};
@@ -654,7 +632,7 @@ class DownloadEngine {
       this._processQueue();
 
     } catch (error: any) {
-      if (isCancelled || error.message?.includes('cancel') || error.message?.includes('abort')) {
+      if (isCancelled || error.message?.includes('cancel') || error.message?.includes('abort') || error.message?.includes('canceled')) {
         // Paused by user! KEEP tempPartPath on disk so resume continues from existing bytes!
         return;
       }
@@ -679,18 +657,54 @@ class DownloadEngine {
       try {
         if (typeof active.cancel === 'function') {
           active.cancel(true);
-        } else if (typeof active.cancel === 'function') {
-          active.cancel();
         }
       } catch (e) {}
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
     }
 
-    this.updateDownloadState(id, {
-      status: 'paused',
-      speed: 0,
-    });
+    // Measure exact bytes on disk from all parts
+    const download = this.downloads.find(d => d.id === id);
+    if (download) {
+      const downloadDir = this.getDownloadDir();
+      const tempPrefix = `${downloadDir}/TurboDownloader/.${id}_part_`;
+      let totalBytesOnDisk = 0;
+      for (let i = 0; i < 16; i++) {
+        try {
+          const p = `${tempPrefix}${i}`;
+          if (await ReactNativeBlobUtil.fs.exists(p)) {
+            const stat = await ReactNativeBlobUtil.fs.stat(p);
+            totalBytesOnDisk += Number(stat.size);
+          }
+        } catch {}
+      }
+
+      if (totalBytesOnDisk === 0 && download.filePath) {
+        try {
+          const tp = `${download.filePath}.part`;
+          if (await ReactNativeBlobUtil.fs.exists(tp)) {
+            const stat = await ReactNativeBlobUtil.fs.stat(tp);
+            totalBytesOnDisk = Number(stat.size);
+          }
+        } catch {}
+      }
+
+      const finalDownloaded = Math.max(download.downloadedSize || 0, totalBytesOnDisk);
+      const safeTotal = download.fileSize || 0;
+      const progress = safeTotal > 0 ? Math.min(1, finalDownloaded / safeTotal) : 0;
+
+      this.updateDownloadState(id, {
+        status: 'paused',
+        downloadedSize: finalDownloaded,
+        progress,
+        speed: 0,
+      });
+    } else {
+      this.updateDownloadState(id, {
+        status: 'paused',
+        speed: 0,
+      });
+    }
 
     await this._persistState();
     this._processQueue();
