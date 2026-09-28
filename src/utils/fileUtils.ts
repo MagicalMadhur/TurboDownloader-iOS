@@ -205,11 +205,22 @@ export function isDownloadableUrl(url: string): boolean {
   if (!url) return false;
   const trimmed = url.trim();
 
+  // 1. Direct extension match via regex on the URL string (handles brackets, spaces, query strings)
+  const isDirectFile = /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mpg|mpeg|mp3|wav|flac|aac|m4a|ogg|wma|opus|zip|rar|7z|tar|gz|bz2|xz|iso|dmg|torrent|apk|ipa|exe|msi|deb|rpm|pdf|epub|doc|docx|xls|xlsx)(\?|#|$)/i.test(trimmed);
+
+  // Check if it's explicitly an HTML/PHP/ASP web page
+  const lower = trimmed.toLowerCase();
+  const isWebPage = /(\.(html|htm|php|asp|aspx|jsp))(\?|#|$)/i.test(lower);
+  if (isDirectFile && !isWebPage) {
+    return true;
+  }
+
   try {
-    const parsed = new URL(trimmed);
+    const safe = normalizeUrl(trimmed);
+    const parsed = new URL(safe);
     const path = parsed.pathname.toLowerCase();
 
-    // 1. Explicitly ignore ordinary web pages and script handlers
+    // 2. Ignore ordinary web pages without download query parameters
     if (
       path.endsWith('.html') ||
       path.endsWith('.htm') ||
@@ -218,7 +229,6 @@ export function isDownloadableUrl(url: string): boolean {
       path.endsWith('.aspx') ||
       path.endsWith('.jsp')
     ) {
-      // Only treat as download if query params explicitly specify a downloadable file name
       let hasFileParam = false;
       for (const [, val] of parsed.searchParams) {
         const vLower = val.toLowerCase();
@@ -230,7 +240,7 @@ export function isDownloadableUrl(url: string): boolean {
       if (!hasFileParam) return false;
     }
 
-    // 2. Direct extension match in pathname
+    // 3. Direct extension match in parsed pathname
     const lastDot = path.lastIndexOf('.');
     if (lastDot !== -1) {
       const ext = path.substring(lastDot + 1);
@@ -239,7 +249,7 @@ export function isDownloadableUrl(url: string): boolean {
       }
     }
 
-    // 3. Check query parameters for direct downloadable filenames
+    // 4. Check query parameters for direct downloadable filenames
     for (const [, val] of parsed.searchParams) {
       const vLower = val.toLowerCase();
       if (DOWNLOADABLE_EXTENSIONS.some(ext => vLower.endsWith(`.${ext}`))) {
@@ -247,14 +257,15 @@ export function isDownloadableUrl(url: string): boolean {
       }
     }
 
-    // 4. Check specific file hosting and download server URL patterns
+    // 5. Check specific file hosting and download server URL patterns
     const hostname = parsed.hostname.toLowerCase();
     if (
       (parsed.searchParams.has('export') && parsed.searchParams.get('export') === 'download') ||
       parsed.searchParams.get('response-content-disposition')?.includes('attachment') ||
       (hostname.includes('pixeldrain.com') && path.startsWith('/api/file/')) ||
       (hostname.includes('gofile.io') && path.startsWith('/download/')) ||
-      (hostname.includes('mediafire.com') && path.includes('/file/'))
+      (hostname.includes('mediafire.com') && path.includes('/file/')) ||
+      (hostname.includes('hubcloud') && (path.includes('/drive/') || path.includes('/download/')))
     ) {
       return true;
     }
@@ -267,6 +278,12 @@ export function isDownloadableUrl(url: string): boolean {
 export function normalizeUrl(rawUrl: string): string {
   if (!rawUrl) return '';
   let url = rawUrl.trim();
+
+  // If already a custom scheme (e.g. magnet:, tg:, mailto:), don't prepend https://
+  if (url.includes(':') && !url.startsWith('http://') && !url.startsWith('https://')) {
+    return url;
+  }
+
   if (!url.startsWith('http://') && !url.startsWith('https://')) {
     url = 'https://' + url;
   }
@@ -290,7 +307,10 @@ export function normalizeUrl(rawUrl: string): string {
       .replace(/\]/g, '%5D')
       .replace(/\|/g, '%7C')
       .replace(/\^/g, '%5E')
-      .replace(/\\/g, '%5C');
+      .replace(/\\/g, '%5C')
+      .replace(/"/g, '%22')
+      .replace(/{/g, '%7B')
+      .replace(/}/g, '%7D');
   }
 }
 

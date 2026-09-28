@@ -122,7 +122,7 @@ export function AddDownloadModal({ visible, onClose, onStartDownload, initialUrl
                 placeholderTextColor={Colors.textTertiary}
                 autoCapitalize="none"
                 autoCorrect={false}
-                keyboardType="url"
+                keyboardType="default"
                 returnKeyType="next"
                 selectionColor={Colors.primary}
               />

@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   Share,
   BackHandler,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { WebView } from 'react-native-webview';
@@ -151,28 +152,64 @@ export function BrowserScreen() {
     if (!url) return false;
 
     const lower = url.toLowerCase();
-    // 1. Block rogue schemes commonly abused by ad networks
-    if (
-      lower.startsWith('itms-app') ||
-      lower.startsWith('market:') ||
-      lower.startsWith('intent:') ||
-      lower.startsWith('tel:') ||
-      lower.startsWith('sms:') ||
-      lower.startsWith('mailto:') ||
-      (lower.startsWith('about:blank') && !isTopFrame)
-    ) {
+
+    // 1. Safe handling of non-HTTP protocols (prevents native iOS WebKit unhandled scheme crashes)
+    if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
+      // Top-frame about:blank is permitted for initialization
+      if (lower.startsWith('about:blank') && isTopFrame) {
+        return true;
+      }
+
+      // Handle Magnet torrent links gracefully: copy to clipboard and notify user
+      if (lower.startsWith('magnet:')) {
+        try {
+          const { Clipboard } = require('react-native');
+          if (Clipboard && Clipboard.setString) {
+            Clipboard.setString(url);
+          }
+          showToast('📋 Magnet link copied to clipboard');
+        } catch {}
+        return false;
+      }
+
+      // Block rogue / ad-network schemes
+      if (
+        lower.startsWith('itms-app') ||
+        lower.startsWith('itms-services') ||
+        lower.startsWith('itms') ||
+        lower.startsWith('market:') ||
+        lower.startsWith('intent:') ||
+        lower.startsWith('javascript:') ||
+        lower.startsWith('blob:') ||
+        lower.startsWith('data:') ||
+        lower.startsWith('about:')
+      ) {
+        return false;
+      }
+
+      // Safe external app links (e.g. Telegram, WhatsApp, tel, mailto)
+      try {
+        Linking.canOpenURL(url).then(supported => {
+          if (supported) {
+            Linking.openURL(url).catch(() => {});
+          }
+        }).catch(() => {});
+      } catch {}
+
+      // CRITICAL: NEVER allow WKWebView to navigate to any non-http(s) scheme natively!
       return false;
     }
 
+    const safeUrl = normalizeUrl(url);
+
     // 2. Check if URL should be blocked (ads, popunders, redirects)
-    if (settings.adBlockEnabled && shouldBlockUrl(url)) {
+    if (settings.adBlockEnabled && (shouldBlockUrl(url) || shouldBlockUrl(safeUrl))) {
       setBlockedCount(prev => prev + 1);
       return false;
     }
 
     // 3. Check if it's a downloadable file
-    if (isDownloadableUrl(url)) {
-      const safeUrl = normalizeUrl(url);
+    if (isDownloadableUrl(safeUrl)) {
       setPendingDownloadUrl(safeUrl);
       setShowDownloadModal(true);
       return false;
@@ -183,8 +220,8 @@ export function BrowserScreen() {
     // and points to a completely different untrusted domain:
     if (settings.adBlockEnabled && currentUrl && currentUrl.startsWith('http')) {
       try {
-        const currentHost = new URL(currentUrl).hostname.replace(/^www\./, '');
-        const targetHost = new URL(url).hostname.replace(/^www\./, '');
+        const currentHost = new URL(normalizeUrl(currentUrl)).hostname.replace(/^www\./, '');
+        const targetHost = new URL(safeUrl).hostname.replace(/^www\./, '');
 
         if (targetHost && targetHost !== currentHost) {
           const isTrustedMediaHost = 
@@ -210,7 +247,7 @@ export function BrowserScreen() {
 
           // If navigationType is 'other' or target is '_blank' and not trusted:
           // This is a classic movie site popunder / tab-under!
-          if ((target === '_blank' || navigationType === 'other') && !isTrustedMediaHost && !isDownloadableUrl(url)) {
+          if ((target === '_blank' || navigationType === 'other') && !isTrustedMediaHost && !isDownloadableUrl(safeUrl)) {
             const isSearchOrHome = url === DEFAULT_HOME || targetHost.includes('google.com') || targetHost.includes('duckduckgo.com');
             if (!isSearchOrHome) {
               setBlockedCount(prev => prev + 1);
@@ -410,6 +447,15 @@ export function BrowserScreen() {
         onLoadStart={() => setIsLoading(true)}
         onLoadEnd={() => setIsLoading(false)}
         onLoadProgress={({ nativeEvent }) => setProgress(nativeEvent.progress)}
+        onContentProcessDidTerminate={() => {
+          console.warn('WebView content process terminated, recovering...');
+          webViewRef.current?.reload();
+        }}
+        onRenderProcessGone={(e: any): boolean => {
+          console.warn('WebView render process gone, recovering...');
+          webViewRef.current?.reload();
+          return true;
+        }}
         setSupportMultipleWindows={false}
         javaScriptCanOpenWindowsAutomatically={false}
         injectedJavaScriptBeforeContentLoaded={`
