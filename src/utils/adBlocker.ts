@@ -3,7 +3,7 @@
 // commonly found on streaming and download sites (YoMovies, VegaMovies, 9xmovies, etc.)
 
 export const AD_BLOCK_RULES = [
-  // Major ad networks
+  // Major ad networks & AdChoices
   '*.doubleclick.net',
   '*.googlesyndication.com',
   '*.googleadservices.com',
@@ -12,6 +12,12 @@ export const AD_BLOCK_RULES = [
   '*.googletagservices.com',
   'adservice.google.com',
   'pagead2.googlesyndication.com',
+  'tpc.googlesyndication.com',
+  'securepubads.g.doubleclick.net',
+  'partner.googleadservices.com',
+  '*.adchoices.com',
+  '*.youradchoices.com',
+  '*.amazon-adsystem.com',
 
   // Facebook & Social Trackers
   '*.facebook.net',
@@ -127,6 +133,25 @@ export const AD_BLOCK_RULES = [
 
 // CSS injection to hide ads, banners, and clickjack overlays
 export const AD_HIDE_CSS = `
+  /* AdChoices, Google Ads, Sponsored Banners */
+  [class*="adchoices"], [id*="adchoices"],
+  [class*="ad-choices"], [id*="ad-choices"],
+  a[href*="adchoices"], a[href*="youradchoices"],
+  img[src*="adchoices"],
+  [id*="google_ads"], [class*="google_ads"],
+  [id*="aswift_"], iframe[id*="aswift_"], iframe[name*="aswift_"],
+  .adsbygoogle, ins.adsbygoogle,
+  div[data-google-query-id],
+  div[data-ad-client], div[data-ad-slot], div[data-ad-format],
+  div[class*="ad_unit"], div[id*="ad_unit"],
+  div[class*="ad_wrapper"], div[id*="ad_wrapper"],
+  div[class*="ad_container"], div[id*="ad_container"],
+  div[class*="native-ad"], div[class*="sponsored-ad"],
+  div[class*="taboola"], div[id*="taboola"],
+  div[class*="outbrain"], div[id*="outbrain"],
+  div[class*="mgid"], div[id*="mgid"],
+  div[class*="adthrive"], div[class*="mediavine"],
+  div[class*="banner-ad"], div[class*="ad-banner"],
   [class*="ad-"], [class*="ads-"], [class*="advert"],
   [id*="ad-"], [id*="ads-"], [id*="advert"],
   [class*="banner"], [class*="sponsor"],
@@ -136,8 +161,8 @@ export const AD_HIDE_CSS = `
   .ad-container, .ad-wrapper, .ad-slot, .ad-unit,
   .ad-banner, .ad-box, .ad-frame, .ad-overlay,
   #ad-container, #ad-wrapper, #ad-slot,
-  .google-ad, .adsense, .adsbygoogle,
-  ins.adsbygoogle, .ad-placeholder,
+  .google-ad, .adsense,
+  .ad-placeholder,
   div[class*="popunder"], div[id*="popunder"],
   div[class*="overlay"][style*="z-index: 999"],
   div[class*="overlay"][style*="z-index:999"] {
@@ -167,91 +192,33 @@ export const AD_HIDE_CSS = `
 export const AD_BLOCK_JS = `
   (function() {
     'use strict';
-    
-    // 0. Ensure navigator properties pass anti-bot / automation checks
-    try {
-      if (navigator.webdriver) {
-        Object.defineProperty(navigator, 'webdriver', {
-          get: function() { return false; },
-          configurable: true
-        });
-      }
-    } catch(e) {}
 
-    // 1. Mock Window Object to satisfy scripts attempting window.open without opening tabs
-    var mockWindow = {
-      closed: true,
-      name: '',
-      document: {
-        write: function(){},
-        writeln: function(){},
-        open: function(){ return this; },
-        close: function(){},
-        location: { href: '', replace: function(){}, assign: function(){}, reload: function(){} }
-      },
-      location: {
-        href: '',
-        replace: function(){},
-        assign: function(){},
-        reload: function(){}
-      },
-      focus: function(){},
-      blur: function(){},
-      close: function(){},
-      postMessage: function(){},
-      addEventListener: function(){},
-      removeEventListener: function(){}
-    };
-
-    try {
-      var safeOpen = function() {
-        console.log('[TurboDownloader] Handled window.open');
-        return mockWindow;
-      };
-      safeOpen.toString = function() { return 'function open() { [native code] }'; };
-      window.open = safeOpen;
-    } catch(e) {}
-
-    // 2. Block popup alerts, confirms, prompts with native function signatures (prevents hook detection)
-    try {
-      var fakeAlert = function() { return null; };
-      fakeAlert.toString = function() { return 'function alert() { [native code] }'; };
-      window.alert = fakeAlert;
-
-      var fakeConfirm = function() { return false; };
-      fakeConfirm.toString = function() { return 'function confirm() { [native code] }'; };
-      window.confirm = fakeConfirm;
-
-      var fakePrompt = function() { return null; };
-      fakePrompt.toString = function() { return 'function prompt() { [native code] }'; };
-      window.prompt = fakePrompt;
-      window.onbeforeunload = null;
-    } catch(e) {}
-
-    // 3. Prevent popunder blur / focus tricks
-    try {
-      window.blur = function() {};
-    } catch(e) {}
-
-    // 4. Clean Clickjacking Overlays & Link targets
-    function sanitizeDOM() {
+    // Helper: detect if page is currently undergoing a Cloudflare or Bot Challenge
+    function isChallengeActive() {
       try {
-        // If current page is a Cloudflare or Bot Challenge stage, DO NOT modify DOM
         var title = (document.title || '').toLowerCase();
         var href = (window.location && window.location.href ? window.location.href : '').toLowerCase();
-        if (
+        return (
           title.indexOf('just a moment') !== -1 ||
           title.indexOf('cloudflare') !== -1 ||
           title.indexOf('attention required') !== -1 ||
           href.indexOf('challenge-platform') !== -1 ||
           href.indexOf('challenges.cloudflare') !== -1 ||
-          document.getElementById('challenge-running') ||
-          document.getElementById('challenge-stage') ||
-          document.querySelector('.cf-turnstile')
-        ) {
-          return;
-        }
+          !!document.getElementById('challenge-running') ||
+          !!document.getElementById('challenge-stage') ||
+          !!document.querySelector('.cf-turnstile') ||
+          !!document.querySelector('iframe[src*="cloudflare"]')
+        );
+      } catch(e) {
+        return false;
+      }
+    }
 
+    // Clean Clickjacking Overlays & Link targets
+    function sanitizeDOM() {
+      if (isChallengeActive()) return;
+
+      try {
         // Strip target="_blank" from links so they don't spawn popups
         var links = document.querySelectorAll('a[target="_blank"]');
         for (var i = 0; i < links.length; i++) {
@@ -303,8 +270,10 @@ export const AD_BLOCK_JS = `
       } catch(err) {}
     }
 
-    // 5. Media Sniffer (IDM style) - Detects video sources for easy 1-tap download
+    // Media Sniffer (IDM style) - Detects video sources for easy 1-tap download
     function sniffMedia() {
+      if (isChallengeActive()) return;
+
       try {
         var videos = document.querySelectorAll('video, audio');
         for (var v = 0; v < videos.length; v++) {
@@ -347,13 +316,14 @@ export const AD_BLOCK_JS = `
       }, true);
     } catch(e) {}
 
-    // Periodic sweep
+    // Periodic sweep (pauses during challenge)
     function runSweep() {
+      if (isChallengeActive()) return;
       sanitizeDOM();
       sniffMedia();
     }
 
-    setInterval(runSweep, 800);
+    setInterval(runSweep, 1000);
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', runSweep);
     } else {
@@ -362,7 +332,8 @@ export const AD_BLOCK_JS = `
 
     // Capture clicks: clean overlays and intercept direct file download clicks
     document.addEventListener('click', function(e) {
-      sanitizeDOM();
+      if (isChallengeActive()) return;
+
       try {
         var el = e.target;
         while (el && el.tagName !== 'A' && el.tagName !== 'BODY') {

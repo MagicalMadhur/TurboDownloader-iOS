@@ -501,7 +501,7 @@ export function BrowserScreen() {
         sharedCookiesEnabled={true}
         startInLoadingState
         decelerationRate="normal"
-        userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+        applicationNameForUserAgent="Version/18.0 Mobile/15E148 Safari/604.1"
         renderLoading={() => (
           <View style={styles.loadingOverlay}>
             <ActivityIndicator size="large" color={Colors.primary} />

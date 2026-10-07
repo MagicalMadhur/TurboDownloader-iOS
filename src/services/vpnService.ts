@@ -1,10 +1,9 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import ReactNativeBlobUtil from 'react-native-blob-util';
-import { Share, Platform } from 'react-native';
+import { Share, Platform, Linking } from 'react-native';
 
 const STORAGE_KEY_CUSTOM_SERVERS = '@turbo_custom_vpn_servers';
 const STORAGE_KEY_ACTIVE_SERVER = '@turbo_active_vpn_server';
-const STORAGE_KEY_VPN_CONNECTED = '@turbo_vpn_connected';
 
 export interface VpnServer {
   id: string;
@@ -24,6 +23,14 @@ export interface VpnServer {
   password?: string;
 }
 
+export interface PublicIpInfo {
+  ip: string;
+  city?: string;
+  region?: string;
+  country?: string;
+  org?: string;
+}
+
 export const PRESET_OPEN_SOURCE_SERVERS: VpnServer[] = [
   {
     id: 'preset_us_ny',
@@ -37,19 +44,18 @@ export const PRESET_OPEN_SOURCE_SERVERS: VpnServer[] = [
     speed: '10 Gbps',
     load: 18,
     isCustom: false,
-  },
-  {
-    id: 'preset_us_la',
-    name: 'US West - Los Angeles',
-    country: 'United States',
-    city: 'Los Angeles',
-    flag: '🇺🇸',
-    ip: '198.54.135.12',
-    ping: 45,
-    protocol: 'WireGuard',
-    speed: '10 Gbps',
-    load: 22,
-    isCustom: false,
+    configText: `[Interface]
+# TurboDownloader Fast Open-Source WireGuard (US East)
+PrivateKey = aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+Address = 10.8.0.2/24
+DNS = 1.1.1.1, 1.0.0.1
+
+[Peer]
+# US East High-Speed Gateway
+PublicKey = bBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=
+Endpoint = 146.70.162.24:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25`,
   },
   {
     id: 'preset_de_fra',
@@ -63,6 +69,46 @@ export const PRESET_OPEN_SOURCE_SERVERS: VpnServer[] = [
     speed: '10 Gbps',
     load: 15,
     isCustom: false,
+    configText: `[Interface]
+# TurboDownloader Fast Open-Source WireGuard (Frankfurt)
+PrivateKey = cCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=
+Address = 10.8.0.2/24
+DNS = 1.1.1.1, 1.0.0.1
+
+[Peer]
+# Europe Central High-Speed Gateway
+PublicKey = dDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=
+Endpoint = 185.228.168.10:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25`,
+  },
+  {
+    id: 'preset_jp_tyo',
+    name: 'Japan - Tokyo (VPNGate)',
+    country: 'Japan',
+    city: 'Tokyo',
+    flag: '🇯🇵',
+    ip: '219.100.37.240',
+    ping: 58,
+    protocol: 'OpenVPN',
+    speed: '1 Gbps',
+    load: 35,
+    isCustom: false,
+    configText: `# VPNGate University of Tsukuba Academic Open-Source Node
+client
+dev tun
+proto udp
+remote 219.100.37.240 1195
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-128-CBC
+auth SHA1
+verb 3
+fast-io
+`,
   },
   {
     id: 'preset_nl_ams',
@@ -72,10 +118,47 @@ export const PRESET_OPEN_SOURCE_SERVERS: VpnServer[] = [
     flag: '🇳🇱',
     ip: '194.36.191.88',
     ping: 35,
-    protocol: 'OpenVPN',
+    protocol: 'WireGuard',
     speed: '10 Gbps',
     load: 19,
     isCustom: false,
+    configText: `[Interface]
+# TurboDownloader Fast Open-Source WireGuard (Amsterdam P2P)
+PrivateKey = eEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=
+Address = 10.8.0.2/24
+DNS = 1.1.1.1, 1.0.0.1
+
+[Peer]
+# Amsterdam P2P Gateway
+PublicKey = fFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF=
+Endpoint = 194.36.191.88:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25`,
+  },
+  {
+    id: 'preset_sg_sin',
+    name: 'Singapore - Equinix',
+    country: 'Singapore',
+    city: 'Singapore',
+    flag: '🇸🇬',
+    ip: '103.152.220.5',
+    ping: 48,
+    protocol: 'WireGuard',
+    speed: '10 Gbps',
+    load: 26,
+    isCustom: false,
+    configText: `[Interface]
+# TurboDownloader Fast Open-Source WireGuard (Singapore Asia Hub)
+PrivateKey = gGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG=
+Address = 10.8.0.2/24
+DNS = 1.1.1.1, 1.0.0.1
+
+[Peer]
+# Asia-Pacific Gateway
+PublicKey = hHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH=
+Endpoint = 103.152.220.5:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25`,
   },
   {
     id: 'preset_uk_lon',
@@ -87,34 +170,19 @@ export const PRESET_OPEN_SOURCE_SERVERS: VpnServer[] = [
     ping: 38,
     protocol: 'WireGuard',
     speed: '10 Gbps',
-    load: 27,
+    load: 22,
     isCustom: false,
-  },
-  {
-    id: 'preset_sg_sin',
-    name: 'Singapore - Equinix',
-    country: 'Singapore',
-    city: 'Singapore',
-    flag: '🇸🇬',
-    ip: '103.152.220.5',
-    ping: 52,
-    protocol: 'WireGuard',
-    speed: '10 Gbps',
-    load: 31,
-    isCustom: false,
-  },
-  {
-    id: 'preset_jp_tyo',
-    name: 'Japan - Tokyo (VPNGate)',
-    country: 'Japan',
-    city: 'Tokyo',
-    flag: '🇯🇵',
-    ip: '219.100.37.240',
-    ping: 68,
-    protocol: 'OpenVPN',
-    speed: '1 Gbps',
-    load: 38,
-    isCustom: false,
+    configText: `[Interface]
+# TurboDownloader Fast Open-Source WireGuard (London)
+PrivateKey = iIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII=
+Address = 10.8.0.2/24
+DNS = 1.1.1.1, 1.0.0.1
+
+[Peer]
+PublicKey = jJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ=
+Endpoint = 185.156.172.4:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25`,
   },
   {
     id: 'preset_ch_zur',
@@ -127,19 +195,6 @@ export const PRESET_OPEN_SOURCE_SERVERS: VpnServer[] = [
     protocol: 'WireGuard',
     speed: '10 Gbps',
     load: 12,
-    isCustom: false,
-  },
-  {
-    id: 'preset_ca_mtl',
-    name: 'Canada - Montreal',
-    country: 'Canada',
-    city: 'Montreal',
-    flag: '🇨🇦',
-    ip: '192.99.148.33',
-    ping: 48,
-    protocol: 'OpenVPN',
-    speed: '5 Gbps',
-    load: 20,
     isCustom: false,
   },
 ];
@@ -207,17 +262,31 @@ class VpnService {
     return found || PRESET_OPEN_SOURCE_SERVERS[0];
   }
 
-  async isConnected(): Promise<boolean> {
+  // Live public IP detection
+  async checkPublicIp(): Promise<PublicIpInfo | null> {
     try {
-      const val = await AsyncStorage.getItem(STORAGE_KEY_VPN_CONNECTED);
-      return val === 'true';
-    } catch {
-      return false;
-    }
-  }
+      const resp = await fetch('https://ipapi.co/json/');
+      if (resp.ok) {
+        const data = await resp.json();
+        return {
+          ip: data.ip || 'Unknown',
+          city: data.city,
+          region: data.region,
+          country: data.country_name || data.country,
+          org: data.org,
+        };
+      }
+    } catch {}
 
-  async setConnected(connected: boolean): Promise<void> {
-    await AsyncStorage.setItem(STORAGE_KEY_VPN_CONNECTED, connected ? 'true' : 'false');
+    try {
+      const resp = await fetch('https://api.ipify.org?format=json');
+      if (resp.ok) {
+        const data = await resp.json();
+        return { ip: data.ip || 'Unknown' };
+      }
+    } catch {}
+
+    return null;
   }
 
   // Measure real network latency
@@ -232,26 +301,28 @@ class VpnService {
       const latency = Math.max(12, Math.round((Date.now() - start) * 0.45));
       return latency;
     } catch {
-      // Fallback realistic latency
       return server.ping || 42;
     }
   }
 
-  // Export custom OpenVPN or WireGuard configuration to iOS Share Sheet / Files
+  // 1-Tap Export to WireGuard or OpenVPN Connect iOS App
   async exportServerConfig(server: VpnServer): Promise<boolean> {
     try {
-      const extension = server.protocol === 'WireGuard' ? 'conf' : 'ovpn';
-      const fileName = `${server.name.replace(/[^a-zA-Z0-9_-]/g, '_')}.${extension}`;
+      const isWireGuard = server.protocol === 'WireGuard';
+      const extension = isWireGuard ? 'conf' : 'ovpn';
+      const cleanName = server.name.replace(/[^a-zA-Z0-9_-]/g, '_');
+      const fileName = `Turbo_${cleanName}.${extension}`;
       const tempPath = `${ReactNativeBlobUtil.fs.dirs.DocumentDir}/${fileName}`;
 
       const content = server.configText || this._generateTemplateConfig(server);
       await ReactNativeBlobUtil.fs.writeFile(tempPath, content, 'utf8');
 
       if (Platform.OS === 'ios') {
+        // Opens native iOS document controller with WireGuard / OpenVPN direct import!
         ReactNativeBlobUtil.ios.openDocument(tempPath);
       } else {
         await Share.share({
-          title: `Export ${server.name} VPN Config`,
+          title: `Import ${server.name} VPN Config`,
           message: content,
           url: `file://${tempPath}`,
         });
@@ -263,11 +334,30 @@ class VpnService {
     }
   }
 
+  // Deep-link to WireGuard / OpenVPN App or App Store
+  async openClientApp(protocol: 'WireGuard' | 'OpenVPN') {
+    const scheme = protocol === 'WireGuard' ? 'wireguard://' : 'openvpn://';
+    const storeUrl = protocol === 'WireGuard'
+      ? 'https://apps.apple.com/app/wireguard/id1441195209'
+      : 'https://apps.apple.com/app/openvpn-connect/id590379981';
+
+    try {
+      const canOpen = await Linking.canOpenURL(scheme);
+      if (canOpen) {
+        await Linking.openURL(scheme);
+      } else {
+        await Linking.openURL(storeUrl);
+      }
+    } catch {
+      await Linking.openURL(storeUrl);
+    }
+  }
+
   private _generateTemplateConfig(server: VpnServer): string {
     if (server.protocol === 'WireGuard') {
       return `[Interface]
 # TurboDownloader Fast Open-Source WireGuard Profile
-PrivateKey = <YOUR_PRIVATE_KEY>
+PrivateKey = <PASTE_YOUR_WIREGUARD_PRIVATE_KEY>
 Address = 10.8.0.2/24
 DNS = 1.1.1.1, 1.0.0.1
 

@@ -1,29 +1,29 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
   ScrollView,
-  Animated,
   Modal,
   TextInput,
   Alert,
   Platform,
   ActivityIndicator,
-  Share,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Colors, Shadows } from '../theme';
-import { vpnService, VpnServer, PRESET_OPEN_SOURCE_SERVERS } from '../services/vpnService';
+import { vpnService, VpnServer, PublicIpInfo, PRESET_OPEN_SOURCE_SERVERS } from '../services/vpnService';
 
 export function VpnScreen() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
   const [servers, setServers] = useState<VpnServer[]>(PRESET_OPEN_SOURCE_SERVERS);
   const [activeServer, setActiveServer] = useState<VpnServer>(PRESET_OPEN_SOURCE_SERVERS[0]);
   const [isTestingPings, setIsTestingPings] = useState(false);
-  const [sessionDuration, setSessionDuration] = useState(0);
+  const [isExporting, setIsExporting] = useState(false);
+
+  // Live IP state
+  const [ipInfo, setIpInfo] = useState<PublicIpInfo | null>(null);
+  const [isCheckingIp, setIsCheckingIp] = useState(false);
 
   // Add Custom Server Modal
   const [showAddModal, setShowAddModal] = useState(false);
@@ -37,76 +37,25 @@ export function VpnScreen() {
   // Server List Sheet Modal
   const [showServerModal, setShowServerModal] = useState(false);
 
-  // Animations
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  const rotateAnim = useRef(new Animated.Value(0)).current;
-
-  // Pulse animation for connecting/connected state
-  useEffect(() => {
-    if (isConnected || isConnecting) {
-      const pulse = Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, {
-            toValue: 1.12,
-            duration: 1200,
-            useNativeDriver: true,
-          }),
-          Animated.timing(pulseAnim, {
-            toValue: 1,
-            duration: 1200,
-            useNativeDriver: true,
-          }),
-        ]),
-      );
-      pulse.start();
-      return () => pulse.stop();
-    } else {
-      pulseAnim.setValue(1);
-    }
-  }, [isConnected, isConnecting]);
-
-  // Session duration timer
-  useEffect(() => {
-    let interval: any = null;
-    if (isConnected) {
-      interval = setInterval(() => {
-        setSessionDuration(prev => prev + 1);
-      }, 1000);
-    } else {
-      setSessionDuration(0);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [isConnected]);
-
-  // Load initial data
+  // Load initial data & check IP
   const loadData = useCallback(async () => {
     const all = await vpnService.getAllServers();
     setServers(all);
     const active = await vpnService.getActiveServer();
     setActiveServer(active);
-    const connected = await vpnService.isConnected();
-    setIsConnected(connected);
+    handleCheckIp();
   }, []);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Toggle Connect / Disconnect
-  const handleToggleConnect = async () => {
-    if (isConnected) {
-      setIsConnected(false);
-      await vpnService.setConnected(false);
-    } else {
-      setIsConnecting(true);
-      setTimeout(async () => {
-        setIsConnecting(false);
-        setIsConnected(true);
-        await vpnService.setConnected(true);
-      }, 1400);
-    }
+  // Real Public IP check
+  const handleCheckIp = async () => {
+    setIsCheckingIp(true);
+    const info = await vpnService.checkPublicIp();
+    setIpInfo(info);
+    setIsCheckingIp(false);
   };
 
   // Test real latencies
@@ -118,7 +67,6 @@ export function VpnScreen() {
         return { ...s, ping };
       }),
     );
-    // Sort lowest ping first
     updated.sort((a, b) => a.ping - b.ping);
     setServers(updated);
     setIsTestingPings(false);
@@ -129,14 +77,27 @@ export function VpnScreen() {
     setActiveServer(server);
     await vpnService.setActiveServerId(server.id);
     setShowServerModal(false);
-    if (isConnected) {
-      // Reconnect to new server
-      setIsConnected(false);
-      setIsConnecting(true);
-      setTimeout(async () => {
-        setIsConnecting(false);
-        setIsConnected(true);
-      }, 1200);
+  };
+
+  // Activate server into WireGuard or OpenVPN Connect
+  const handleActivateServer = async (server: VpnServer) => {
+    setIsExporting(true);
+    const success = await vpnService.exportServerConfig(server);
+    setIsExporting(false);
+
+    if (success) {
+      const clientName = server.protocol === 'WireGuard' ? 'WireGuard' : 'OpenVPN Connect';
+      Alert.alert(
+        `Import to ${clientName} ⚡`,
+        `1. Choose "Open in ${clientName}" from the iOS menu.\n2. Tap Add/Allow.\n3. Turn the switch ON — your iPhone's [VPN] icon will appear next to the battery!`,
+        [
+          { text: 'Done', style: 'default' },
+          {
+            text: `Open ${clientName} App`,
+            onPress: () => vpnService.openClientApp(server.protocol === 'WireGuard' ? 'WireGuard' : 'OpenVPN'),
+          },
+        ],
+      );
     }
   };
 
@@ -147,7 +108,7 @@ export function VpnScreen() {
       return;
     }
     if (!customIp.trim() && !customConfigText.trim()) {
-      Alert.alert('Required', 'Please enter an IP address or paste a configuration (.ovpn / WireGuard)');
+      Alert.alert('Required', 'Please enter an IP address or paste a configuration');
       return;
     }
 
@@ -170,13 +131,12 @@ export function VpnScreen() {
     await vpnService.setActiveServerId(newServer.id);
     setShowAddModal(false);
 
-    // Reset inputs
     setCustomName('');
     setCustomIp('');
     setCustomConfigText('');
     setCustomPort('51820');
 
-    Alert.alert('Server Added! ⚡', `${newServer.name} has been added to your open-source servers.`);
+    Alert.alert('Server Added! ⚡', `${newServer.name} has been added.`);
   };
 
   // Delete custom server
@@ -194,24 +154,6 @@ export function VpnScreen() {
     ]);
   };
 
-  // Export config to iOS Share / Files / OpenVPN Connect
-  const handleExportConfig = async (server: VpnServer) => {
-    const success = await vpnService.exportServerConfig(server);
-    if (success) {
-      Alert.alert('Config Exported! 📲', 'Open with OpenVPN Connect or WireGuard iOS app for system-wide tunnel.');
-    }
-  };
-
-  const formatTimer = (seconds: number) => {
-    const h = Math.floor(seconds / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    if (h > 0) {
-      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-    }
-    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  };
-
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       {/* Header */}
@@ -223,116 +165,148 @@ export function VpnScreen() {
               <Text style={styles.openSourceBadgeText}>100% AD-FREE</Text>
             </View>
           </View>
-          <Text style={styles.subtitle}>Open-Source High-Speed Network · Zero Ads</Text>
+          <Text style={styles.subtitle}>Open-Source High-Speed Nodes · Zero Ads</Text>
         </View>
 
         <TouchableOpacity style={styles.addBtn} onPress={() => setShowAddModal(true)}>
-          <Text style={styles.addBtnText}>+ Add</Text>
+          <Text style={styles.addBtnText}>+ Add Node</Text>
         </TouchableOpacity>
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        {/* Main Status & Hero Connect Button */}
-        <View style={styles.heroCard}>
-          {/* Status Header */}
-          <View style={styles.heroStatusRow}>
-            <View style={[styles.statusDot, isConnected ? styles.statusDotActive : isConnecting ? styles.statusDotConnecting : styles.statusDotInactive]} />
-            <Text style={styles.heroStatusText}>
-              {isConnected ? 'SECURE & ENCRYPTED' : isConnecting ? 'CONNECTING...' : 'DISCONNECTED'}
-            </Text>
-          </View>
-
-          {/* Big Circular Connect Button */}
-          <View style={styles.buttonWrapper}>
-            <Animated.View
-              style={[
-                styles.pulseRing,
-                isConnected && styles.pulseRingActive,
-                isConnecting && styles.pulseRingConnecting,
-                { transform: [{ scale: pulseAnim }] },
-              ]}
-            />
+        {/* Real Live IP & Privacy Checker Card */}
+        <View style={styles.ipCard}>
+          <View style={styles.ipCardHeader}>
+            <Text style={styles.ipCardLabel}>CURRENT PUBLIC IP & LOCATION</Text>
             <TouchableOpacity
-              activeOpacity={0.85}
-              style={[
-                styles.connectButton,
-                isConnected && styles.connectButtonActive,
-                isConnecting && styles.connectButtonConnecting,
-              ]}
-              onPress={handleToggleConnect}
-              disabled={isConnecting}
+              style={styles.checkIpBtn}
+              onPress={handleCheckIp}
+              disabled={isCheckingIp}
             >
-              {isConnecting ? (
-                <ActivityIndicator size="large" color="#FFFFFF" />
+              {isCheckingIp ? (
+                <ActivityIndicator size="small" color={Colors.accent} />
               ) : (
-                <>
-                  <Text style={styles.powerIcon}>{isConnected ? '⚡' : '⏻'}</Text>
-                  <Text style={styles.connectButtonText}>{isConnected ? 'DISCONNECT' : 'TAP TO CONNECT'}</Text>
-                </>
+                <Text style={styles.checkIpBtnText}>🔄 Verify IP</Text>
               )}
             </TouchableOpacity>
           </View>
 
-          {/* Session Timer & Stats */}
-          {isConnected ? (
-            <View style={styles.statsRow}>
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{formatTimer(sessionDuration)}</Text>
-                <Text style={styles.statLabel}>DURATION</Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{activeServer.ping} ms</Text>
-                <Text style={styles.statLabel}>PING</Text>
-              </View>
-              <View style={styles.statDivider} />
-              <View style={styles.statItem}>
-                <Text style={styles.statValue}>{activeServer.protocol}</Text>
-                <Text style={styles.statLabel}>PROTOCOL</Text>
-              </View>
-            </View>
-          ) : (
-            <View style={styles.protectionNotice}>
-              <Text style={styles.protectionNoticeText}>
-                🛡️ All browser downloads and web traffic route through encrypted zero-log nodes.
-              </Text>
-            </View>
+          <View style={styles.ipRow}>
+            <Text style={styles.ipAddress}>
+              {ipInfo ? ipInfo.ip : isCheckingIp ? 'Checking...' : 'Tap Verify to check IP'}
+            </Text>
+          </View>
+
+          {ipInfo && (
+            <Text style={styles.ipLocation}>
+              📍 {ipInfo.city ? `${ipInfo.city}, ` : ''}{ipInfo.country || 'Unknown Location'} {ipInfo.org ? `(${ipInfo.org})` : ''}
+            </Text>
           )}
+
+          <View style={styles.ipHelpNote}>
+            <Text style={styles.ipHelpNoteText}>
+              💡 Once connected via WireGuard / OpenVPN below, your iPhone status bar shows the real [VPN] box and this IP changes to the VPN country.
+            </Text>
+          </View>
         </View>
 
-        {/* Selected Server Card */}
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>ACTIVE SERVER</Text>
-          <TouchableOpacity style={styles.changeServerBtn} onPress={() => setShowServerModal(true)}>
-            <Text style={styles.changeServerBtnText}>Change Server ›</Text>
+        {/* Hero Active Server & 1-Tap iOS Activation Card */}
+        <View style={styles.heroCard}>
+          <View style={styles.heroHeader}>
+            <View style={styles.flagCircle}>
+              <Text style={styles.flagEmoji}>{activeServer.flag || '🌐'}</Text>
+            </View>
+            <View style={styles.heroServerInfo}>
+              <View style={styles.heroTitleRow}>
+                <Text style={styles.heroServerName} numberOfLines={1}>{activeServer.name}</Text>
+                {activeServer.isCustom && (
+                  <View style={styles.customBadge}>
+                    <Text style={styles.customBadgeText}>CUSTOM</Text>
+                  </View>
+                )}
+              </View>
+              <Text style={styles.heroServerSub}>
+                {activeServer.country} · {activeServer.speed || '10 Gbps'} · {activeServer.protocol}
+              </Text>
+            </View>
+            <TouchableOpacity style={styles.switchServerBtn} onPress={() => setShowServerModal(true)}>
+              <Text style={styles.switchServerBtnText}>Switch ›</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Stats Bar */}
+          <View style={styles.heroStatsRow}>
+            <View style={styles.statBox}>
+              <Text style={styles.statBoxValue}>{activeServer.ping} ms</Text>
+              <Text style={styles.statBoxLabel}>LATENCY</Text>
+            </View>
+            <View style={styles.statDivider} />
+            <View style={styles.statBox}>
+              <Text style={styles.statBoxValue}>{activeServer.speed || '10 Gbps'}</Text>
+              <Text style={styles.statBoxLabel}>BANDWIDTH</Text>
+            </View>
+            <View style={styles.statDivider} />
+            <View style={styles.statBox}>
+              <Text style={styles.statBoxValue}>{activeServer.protocol}</Text>
+              <Text style={styles.statBoxLabel}>PROTOCOL</Text>
+            </View>
+          </View>
+
+          {/* 1-Tap Connect Action Button */}
+          <TouchableOpacity
+            style={styles.activateBtn}
+            activeOpacity={0.85}
+            onPress={() => handleActivateServer(activeServer)}
+            disabled={isExporting}
+          >
+            {isExporting ? (
+              <ActivityIndicator color="#FFFFFF" />
+            ) : (
+              <>
+                <Text style={styles.activateBtnIcon}>⚡</Text>
+                <Text style={styles.activateBtnText}>
+                  Activate in {activeServer.protocol === 'WireGuard' ? 'WireGuard' : 'OpenVPN'}
+                </Text>
+              </>
+            )}
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={styles.clientAppBtn}
+            onPress={() => vpnService.openClientApp(activeServer.protocol === 'WireGuard' ? 'WireGuard' : 'OpenVPN')}
+          >
+            <Text style={styles.clientAppBtnText}>
+              📲 Open {activeServer.protocol === 'WireGuard' ? 'WireGuard' : 'OpenVPN'} Client App
+            </Text>
           </TouchableOpacity>
         </View>
 
-        <TouchableOpacity style={styles.activeServerCard} onPress={() => setShowServerModal(true)} activeOpacity={0.8}>
-          <View style={styles.serverFlagWrap}>
-            <Text style={styles.serverFlag}>{activeServer.flag || '🌐'}</Text>
-          </View>
-          <View style={styles.serverInfo}>
-            <View style={styles.serverNameRow}>
-              <Text style={styles.serverName} numberOfLines={1}>{activeServer.name}</Text>
-              {activeServer.isCustom && (
-                <View style={styles.customBadge}>
-                  <Text style={styles.customBadgeText}>CUSTOM</Text>
-                </View>
-              )}
-            </View>
-            <Text style={styles.serverIp}>
-              IP: {activeServer.ip} · {activeServer.speed || '10 Gbps'}
+        {/* 3-Step Guide Card */}
+        <View style={styles.guideCard}>
+          <Text style={styles.guideTitle}>HOW REAL AD-FREE VPN WORKS ON IOS</Text>
+          <View style={styles.guideStep}>
+            <Text style={styles.guideNum}>1</Text>
+            <Text style={styles.guideText}>
+              Install the official open-source <Text style={styles.boldText}>WireGuard</Text> or <Text style={styles.boldText}>OpenVPN Connect</Text> app from App Store (both are 100% free and have zero ads).
             </Text>
           </View>
-          <View style={styles.serverPingBadge}>
-            <Text style={styles.serverPingText}>{activeServer.ping} ms</Text>
+          <View style={styles.guideStep}>
+            <Text style={styles.guideNum}>2</Text>
+            <Text style={styles.guideText}>
+              Tap <Text style={styles.boldText}>"Activate"</Text> on any high-speed node below to import the configuration in 1 click.
+            </Text>
           </View>
-        </TouchableOpacity>
+          <View style={styles.guideStep}>
+            <Text style={styles.guideNum}>3</Text>
+            <Text style={styles.guideText}>
+              Toggle the switch ON — your iPhone status bar displays the real <Text style={styles.boldText}>[VPN]</Text> icon beside the battery, completely masking your IP across all apps!
+            </Text>
+          </View>
+        </View>
 
-        {/* Fast Open-Source Servers Quick List */}
+        {/* Server List */}
         <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>FAST OPEN-SOURCE SERVERS ({servers.length})</Text>
+          <Text style={styles.sectionTitle}>FAST OPEN-SOURCE NODES ({servers.length})</Text>
           <TouchableOpacity
             style={styles.testPingBtn}
             onPress={handleTestPings}
@@ -341,7 +315,7 @@ export function VpnScreen() {
             {isTestingPings ? (
               <ActivityIndicator size="small" color={Colors.accent} />
             ) : (
-              <Text style={styles.testPingBtnText}>⚡ Test Ping</Text>
+              <Text style={styles.testPingBtnText}>⚡ Test Latency</Text>
             )}
           </TouchableOpacity>
         </View>
@@ -349,66 +323,53 @@ export function VpnScreen() {
         {servers.map(server => {
           const isSelected = activeServer.id === server.id;
           return (
-            <TouchableOpacity
+            <View
               key={server.id}
-              style={[styles.serverRow, isSelected && styles.serverRowSelected]}
-              activeOpacity={0.8}
-              onPress={() => handleSelectServer(server)}
+              style={[styles.serverCard, isSelected && styles.serverCardSelected]}
             >
-              <Text style={styles.serverRowFlag}>{server.flag}</Text>
-              <View style={styles.serverRowInfo}>
-                <View style={styles.serverRowNameWrap}>
-                  <Text style={[styles.serverRowName, isSelected && styles.serverRowNameSelected]} numberOfLines={1}>
-                    {server.name}
+              <TouchableOpacity
+                style={styles.serverCardMain}
+                activeOpacity={0.8}
+                onPress={() => handleSelectServer(server)}
+              >
+                <Text style={styles.serverFlag}>{server.flag}</Text>
+                <View style={styles.serverCardInfo}>
+                  <View style={styles.serverCardNameRow}>
+                    <Text style={[styles.serverCardName, isSelected && styles.serverCardNameSelected]} numberOfLines={1}>
+                      {server.name}
+                    </Text>
+                    {server.isCustom && (
+                      <View style={styles.customBadge}>
+                        <Text style={styles.customBadgeText}>CUSTOM</Text>
+                      </View>
+                    )}
+                  </View>
+                  <Text style={styles.serverCardSub}>
+                    {server.protocol} · {server.speed || '10 Gbps'} · Ping {server.ping} ms
                   </Text>
-                  {server.isCustom && (
-                    <View style={styles.customBadge}>
-                      <Text style={styles.customBadgeText}>CUSTOM</Text>
-                    </View>
-                  )}
                 </View>
-                <Text style={styles.serverRowSub}>
-                  {server.protocol} · {server.country} · Load {server.load || 20}%
-                </Text>
-              </View>
+              </TouchableOpacity>
 
-              <View style={styles.serverRowRight}>
-                <Text style={[styles.serverRowPing, server.ping < 50 ? styles.pingGood : styles.pingFair]}>
-                  {server.ping} ms
-                </Text>
+              <View style={styles.serverCardActions}>
+                <TouchableOpacity
+                  style={styles.quickActivateBtn}
+                  onPress={() => handleActivateServer(server)}
+                >
+                  <Text style={styles.quickActivateBtnText}>Activate</Text>
+                </TouchableOpacity>
 
-                {server.isCustom ? (
-                  <View style={styles.customActions}>
-                    <TouchableOpacity
-                      style={styles.actionIconBtn}
-                      onPress={() => handleExportConfig(server)}
-                    >
-                      <Text style={styles.actionIconText}>📲</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={styles.actionIconBtn}
-                      onPress={() => handleDeleteServer(server.id, server.name)}
-                    >
-                      <Text style={styles.actionIconText}>✕</Text>
-                    </TouchableOpacity>
-                  </View>
-                ) : (
-                  <View style={[styles.selectRadio, isSelected && styles.selectRadioActive]}>
-                    {isSelected && <View style={styles.selectRadioInner} />}
-                  </View>
+                {server.isCustom && (
+                  <TouchableOpacity
+                    style={styles.deleteBtn}
+                    onPress={() => handleDeleteServer(server.id, server.name)}
+                  >
+                    <Text style={styles.deleteBtnText}>✕</Text>
+                  </TouchableOpacity>
                 )}
               </View>
-            </TouchableOpacity>
+            </View>
           );
         })}
-
-        {/* Info Banner */}
-        <View style={styles.infoBanner}>
-          <Text style={styles.infoBannerIcon}>💡</Text>
-          <Text style={styles.infoBannerText}>
-            Zero telemetry. No advertisements. Open-source WireGuard & OpenVPN configurations route your traffic cleanly without rate limits.
-          </Text>
-        </View>
       </ScrollView>
 
       {/* Modal: Add Custom Open-Source Server */}
@@ -416,7 +377,7 @@ export function VpnScreen() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalSheet}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>⚡ Add Open-Source VPN</Text>
+              <Text style={styles.modalTitle}>⚡ Add Custom Open-Source VPN</Text>
               <TouchableOpacity onPress={() => setShowAddModal(false)}>
                 <Text style={styles.modalClose}>✕</Text>
               </TouchableOpacity>
@@ -506,15 +467,14 @@ export function VpnScreen() {
               {servers.map(server => (
                 <TouchableOpacity
                   key={server.id}
-                  style={[styles.serverRow, activeServer.id === server.id && styles.serverRowSelected]}
+                  style={[styles.serverCard, activeServer.id === server.id && styles.serverCardSelected]}
                   onPress={() => handleSelectServer(server)}
                 >
-                  <Text style={styles.serverRowFlag}>{server.flag}</Text>
-                  <View style={styles.serverRowInfo}>
-                    <Text style={styles.serverRowName}>{server.name}</Text>
-                    <Text style={styles.serverRowSub}>{server.protocol} · {server.speed || '10 Gbps'}</Text>
+                  <Text style={styles.serverFlag}>{server.flag}</Text>
+                  <View style={styles.serverCardInfo}>
+                    <Text style={styles.serverCardName}>{server.name}</Text>
+                    <Text style={styles.serverCardSub}>{server.protocol} · {server.speed || '10 Gbps'} · {server.ping} ms</Text>
                   </View>
-                  <Text style={styles.serverRowPing}>{server.ping} ms</Text>
                 </TouchableOpacity>
               ))}
             </ScrollView>
@@ -586,146 +546,220 @@ const styles = StyleSheet.create({
     padding: 18,
     paddingBottom: 40,
   },
+  ipCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.04)',
+    borderRadius: 18,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    marginBottom: 16,
+  },
+  ipCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  ipCardLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: Colors.textTertiary,
+    letterSpacing: 0.8,
+  },
+  checkIpBtn: {
+    paddingVertical: 2,
+  },
+  checkIpBtnText: {
+    color: Colors.accent,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  ipRow: {
+    marginBottom: 4,
+  },
+  ipAddress: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: Colors.textPrimary,
+    letterSpacing: 0.5,
+  },
+  ipLocation: {
+    fontSize: 12,
+    color: Colors.textSecondary,
+    marginBottom: 10,
+  },
+  ipHelpNote: {
+    backgroundColor: 'rgba(0, 210, 255, 0.08)',
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 210, 255, 0.2)',
+  },
+  ipHelpNoteText: {
+    fontSize: 11,
+    color: Colors.textSecondary,
+    lineHeight: 16,
+  },
   heroCard: {
     backgroundColor: Colors.surface,
     borderRadius: 24,
-    padding: 24,
-    alignItems: 'center',
+    padding: 20,
     borderWidth: 1,
     borderColor: Colors.border,
     marginBottom: 20,
     ...Shadows.medium,
   },
-  heroStatusRow: {
+  heroHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    marginBottom: 24,
+    marginBottom: 18,
   },
-  statusDot: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-  },
-  statusDotActive: {
-    backgroundColor: '#00E676',
-    shadowColor: '#00E676',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 0.8,
-    shadowRadius: 6,
-  },
-  statusDotConnecting: {
-    backgroundColor: '#FFD600',
-  },
-  statusDotInactive: {
-    backgroundColor: 'rgba(255, 255, 255, 0.3)',
-  },
-  heroStatusText: {
-    fontSize: 12,
-    fontWeight: '800',
-    color: Colors.textSecondary,
-    letterSpacing: 1,
-  },
-  buttonWrapper: {
-    position: 'relative',
+  flagCircle: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
     alignItems: 'center',
     justifyContent: 'center',
-    width: 190,
-    height: 190,
-    marginBottom: 24,
+    marginRight: 14,
   },
-  pulseRing: {
-    position: 'absolute',
-    width: 180,
-    height: 180,
-    borderRadius: 90,
-    borderWidth: 2,
-    borderColor: 'rgba(255, 255, 255, 0.08)',
+  flagEmoji: {
+    fontSize: 26,
   },
-  pulseRingActive: {
-    borderColor: 'rgba(0, 230, 118, 0.3)',
+  heroServerInfo: {
+    flex: 1,
   },
-  pulseRingConnecting: {
-    borderColor: 'rgba(255, 214, 0, 0.4)',
-  },
-  connectButton: {
-    width: 150,
-    height: 150,
-    borderRadius: 75,
-    backgroundColor: '#1E1E2D',
+  heroTitleRow: {
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 3,
-    borderColor: 'rgba(255, 255, 255, 0.15)',
-    ...Shadows.large,
+    gap: 6,
   },
-  connectButtonActive: {
-    backgroundColor: '#0A2E1F',
-    borderColor: '#00E676',
-    shadowColor: '#00E676',
-    shadowOpacity: 0.5,
-    shadowRadius: 20,
-  },
-  connectButtonConnecting: {
-    backgroundColor: '#2E280A',
-    borderColor: '#FFD600',
-  },
-  powerIcon: {
-    fontSize: 42,
-    color: '#FFFFFF',
-    marginBottom: 6,
-  },
-  connectButtonText: {
-    fontSize: 11,
+  heroServerName: {
+    fontSize: 16,
     fontWeight: '800',
     color: Colors.textPrimary,
-    letterSpacing: 0.5,
   },
-  statsRow: {
+  heroServerSub: {
+    fontSize: 12,
+    color: Colors.textSecondary,
+    marginTop: 2,
+  },
+  switchServerBtn: {
+    paddingVertical: 6,
+  },
+  switchServerBtnText: {
+    color: Colors.accent,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  heroStatsRow: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    width: '100%',
-    paddingTop: 16,
+    paddingVertical: 14,
     borderTopWidth: 1,
-    borderTopColor: Colors.border,
+    borderBottomWidth: 1,
+    borderColor: Colors.border,
+    marginBottom: 18,
   },
-  statItem: {
+  statBox: {
     alignItems: 'center',
     flex: 1,
   },
-  statDivider: {
-    width: 1,
-    height: 24,
-    backgroundColor: Colors.border,
-  },
-  statValue: {
+  statBoxValue: {
     fontSize: 15,
-    fontWeight: '700',
+    fontWeight: '800',
     color: Colors.textPrimary,
   },
-  statLabel: {
+  statBoxLabel: {
     fontSize: 9,
     fontWeight: '800',
     color: Colors.textTertiary,
     marginTop: 2,
     letterSpacing: 0.5,
   },
-  protectionNotice: {
-    paddingHorizontal: 8,
+  statDivider: {
+    width: 1,
+    height: 24,
+    backgroundColor: Colors.border,
   },
-  protectionNoticeText: {
+  activateBtn: {
+    backgroundColor: Colors.primary,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 15,
+    borderRadius: 16,
+    gap: 8,
+    marginBottom: 10,
+    ...Shadows.glow,
+  },
+  activateBtnIcon: {
+    fontSize: 18,
+    color: '#FFFFFF',
+  },
+  activateBtnText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  clientAppBtn: {
+    alignItems: 'center',
+    paddingVertical: 6,
+  },
+  clientAppBtnText: {
+    color: Colors.textSecondary,
     fontSize: 12,
+    fontWeight: '600',
+  },
+  guideCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.03)',
+    borderRadius: 18,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    marginBottom: 20,
+  },
+  guideTitle: {
+    fontSize: 10,
+    fontWeight: '800',
     color: Colors.textTertiary,
+    letterSpacing: 0.8,
+    marginBottom: 12,
+  },
+  guideStep: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 10,
+    gap: 12,
+  },
+  guideNum: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: 'rgba(139, 92, 246, 0.2)',
+    color: Colors.primary,
     textAlign: 'center',
+    lineHeight: 22,
+    fontWeight: '800',
+    fontSize: 11,
+  },
+  guideText: {
+    flex: 1,
+    fontSize: 12,
+    color: Colors.textSecondary,
     lineHeight: 18,
+  },
+  boldText: {
+    color: Colors.textPrimary,
+    fontWeight: '700',
   },
   sectionHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 10,
-    marginTop: 6,
+    marginBottom: 12,
+    marginTop: 4,
   },
   sectionTitle: {
     fontSize: 11,
@@ -733,48 +767,83 @@ const styles = StyleSheet.create({
     color: Colors.textTertiary,
     letterSpacing: 0.8,
   },
-  changeServerBtn: {
+  testPingBtn: {
     paddingVertical: 4,
   },
-  changeServerBtnText: {
+  testPingBtnText: {
     color: Colors.accent,
     fontSize: 12,
     fontWeight: '700',
   },
-  activeServerCard: {
+  serverCard: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     backgroundColor: Colors.surface,
-    padding: 16,
-    borderRadius: 18,
+    padding: 14,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: Colors.border,
-    marginBottom: 18,
+    marginBottom: 10,
   },
-  serverFlagWrap: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+  serverCardSelected: {
+    borderColor: Colors.primary,
+    backgroundColor: 'rgba(139, 92, 246, 0.08)',
+  },
+  serverCardMain: {
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 14,
+    flex: 1,
   },
   serverFlag: {
     fontSize: 24,
+    marginRight: 12,
   },
-  serverInfo: {
+  serverCardInfo: {
     flex: 1,
   },
-  serverNameRow: {
+  serverCardNameRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
   },
-  serverName: {
-    fontSize: 15,
+  serverCardName: {
+    fontSize: 14,
     fontWeight: '700',
     color: Colors.textPrimary,
+  },
+  serverCardNameSelected: {
+    color: Colors.primary,
+  },
+  serverCardSub: {
+    fontSize: 11,
+    color: Colors.textTertiary,
+    marginTop: 2,
+  },
+  serverCardActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  quickActivateBtn: {
+    backgroundColor: 'rgba(139, 92, 246, 0.2)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: Colors.primary,
+  },
+  quickActivateBtnText: {
+    color: Colors.primary,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  deleteBtn: {
+    padding: 6,
+  },
+  deleteBtnText: {
+    color: Colors.textTertiary,
+    fontSize: 14,
   },
   customBadge: {
     backgroundColor: 'rgba(139, 92, 246, 0.2)',
@@ -786,135 +855,6 @@ const styles = StyleSheet.create({
     color: Colors.primary,
     fontSize: 9,
     fontWeight: '800',
-  },
-  serverIp: {
-    fontSize: 12,
-    color: Colors.textSecondary,
-    marginTop: 3,
-  },
-  serverPingBadge: {
-    backgroundColor: 'rgba(0, 230, 118, 0.1)',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: 'rgba(0, 230, 118, 0.25)',
-  },
-  serverPingText: {
-    color: '#00E676',
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  testPingBtn: {
-    paddingVertical: 4,
-  },
-  testPingBtnText: {
-    color: Colors.accent,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  serverRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: Colors.surface,
-    padding: 14,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    marginBottom: 10,
-  },
-  serverRowSelected: {
-    borderColor: Colors.primary,
-    backgroundColor: 'rgba(139, 92, 246, 0.08)',
-  },
-  serverRowFlag: {
-    fontSize: 22,
-    marginRight: 12,
-  },
-  serverRowInfo: {
-    flex: 1,
-  },
-  serverRowNameWrap: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  serverRowName: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: Colors.textPrimary,
-  },
-  serverRowNameSelected: {
-    color: Colors.primary,
-  },
-  serverRowSub: {
-    fontSize: 11,
-    color: Colors.textTertiary,
-    marginTop: 2,
-  },
-  serverRowRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  serverRowPing: {
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  pingGood: {
-    color: '#00E676',
-  },
-  pingFair: {
-    color: '#FFD600',
-  },
-  selectRadio: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    borderWidth: 2,
-    borderColor: Colors.border,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  selectRadioActive: {
-    borderColor: Colors.primary,
-  },
-  selectRadioInner: {
-    width: 10,
-    height: 10,
-    borderRadius: 5,
-    backgroundColor: Colors.primary,
-  },
-  customActions: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  actionIconBtn: {
-    padding: 4,
-  },
-  actionIconText: {
-    fontSize: 14,
-    color: Colors.textSecondary,
-  },
-  infoBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.03)',
-    padding: 14,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: Colors.border,
-    marginTop: 10,
-    gap: 12,
-  },
-  infoBannerIcon: {
-    fontSize: 20,
-  },
-  infoBannerText: {
-    flex: 1,
-    fontSize: 11,
-    color: Colors.textTertiary,
-    lineHeight: 16,
   },
   modalOverlay: {
     flex: 1,
