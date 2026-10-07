@@ -7,6 +7,7 @@ import { useDownloads } from '../context/DownloadContext';
 import { DownloadsScreen } from '../screens/DownloadsScreen';
 import { BrowserScreen } from '../screens/BrowserScreen';
 import { FilesScreen } from '../screens/FilesScreen';
+import { VpnScreen } from '../screens/VpnScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 
 const Tab = createBottomTabNavigator();
@@ -14,6 +15,7 @@ const Tab = createBottomTabNavigator();
 const TAB_ICONS: Record<string, { active: string; inactive: string }> = {
   Downloads: { active: '⚡', inactive: '⬇️' },
   Browser: { active: '🌐', inactive: '🌐' },
+  VPN: { active: '🛡️', inactive: '🛡️' },
   Files: { active: '📂', inactive: '📁' },
   Settings: { active: '⚙️', inactive: '⚙️' },
 };
@@ -74,6 +76,7 @@ export function AppNavigator() {
           }}
         />
         <Tab.Screen name="Browser" component={BrowserScreen} />
+        <Tab.Screen name="VPN" component={VpnScreen} />
         <Tab.Screen name="Files" component={FilesScreen} />
         <Tab.Screen name="Settings" component={SettingsScreen} />
       </Tab.Navigator>
