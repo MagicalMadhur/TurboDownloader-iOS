@@ -130,7 +130,8 @@ export const AD_HIDE_CSS = `
   [class*="ad-"], [class*="ads-"], [class*="advert"],
   [id*="ad-"], [id*="ads-"], [id*="advert"],
   [class*="banner"], [class*="sponsor"],
-  iframe[src*="ad"], iframe[src*="doubleclick"], iframe[src*="pop"],
+  iframe[src*="doubleclick"], iframe[src*="pop"],
+  iframe[src*="/ads/"], iframe[src*="adservice"], iframe[src*="adserver"], iframe[src*="ads."],
   div[data-ad], div[data-ads], div[data-advert],
   .ad-container, .ad-wrapper, .ad-slot, .ad-unit,
   .ad-banner, .ad-box, .ad-frame, .ad-overlay,
@@ -147,6 +148,18 @@ export const AD_HIDE_CSS = `
     overflow: hidden !important;
     pointer-events: none !important;
   }
+
+  /* Never hide Cloudflare, Turnstile, Captcha challenge frames & backdrops */
+  #challenge-stage, #challenge-running, [id*="challenge"], [class*="challenge"],
+  [id*="cf-"], [class*="cf-"], [id*="turnstile"], [class*="turnstile"],
+  iframe[src*="cloudflare"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"] {
+    display: block !important;
+    visibility: visible !important;
+    height: auto !important;
+    max-height: none !important;
+    pointer-events: auto !important;
+    opacity: 1 !important;
+  }
 `;
 
 // Advanced script to run BEFORE and DURING page execution
@@ -155,6 +168,16 @@ export const AD_BLOCK_JS = `
   (function() {
     'use strict';
     
+    // 0. Ensure navigator properties pass anti-bot / automation checks
+    try {
+      if (navigator.webdriver) {
+        Object.defineProperty(navigator, 'webdriver', {
+          get: function() { return false; },
+          configurable: true
+        });
+      }
+    } catch(e) {}
+
     // 1. Mock Window Object to satisfy scripts attempting window.open without opening tabs
     var mockWindow = {
       closed: true,
@@ -181,17 +204,27 @@ export const AD_BLOCK_JS = `
     };
 
     try {
-      window.open = function() {
-        console.log('[TurboDownloader] Blocked window.open popup attempt');
+      var safeOpen = function() {
+        console.log('[TurboDownloader] Handled window.open');
         return mockWindow;
       };
+      safeOpen.toString = function() { return 'function open() { [native code] }'; };
+      window.open = safeOpen;
     } catch(e) {}
 
-    // 2. Block popup alerts, confirms, prompts (scareware)
+    // 2. Block popup alerts, confirms, prompts with native function signatures (prevents hook detection)
     try {
-      window.alert = function() { return null; };
-      window.confirm = function() { return false; };
-      window.prompt = function() { return null; };
+      var fakeAlert = function() { return null; };
+      fakeAlert.toString = function() { return 'function alert() { [native code] }'; };
+      window.alert = fakeAlert;
+
+      var fakeConfirm = function() { return false; };
+      fakeConfirm.toString = function() { return 'function confirm() { [native code] }'; };
+      window.confirm = fakeConfirm;
+
+      var fakePrompt = function() { return null; };
+      fakePrompt.toString = function() { return 'function prompt() { [native code] }'; };
+      window.prompt = fakePrompt;
       window.onbeforeunload = null;
     } catch(e) {}
 
@@ -203,6 +236,22 @@ export const AD_BLOCK_JS = `
     // 4. Clean Clickjacking Overlays & Link targets
     function sanitizeDOM() {
       try {
+        // If current page is a Cloudflare or Bot Challenge stage, DO NOT modify DOM
+        var title = (document.title || '').toLowerCase();
+        var href = (window.location && window.location.href ? window.location.href : '').toLowerCase();
+        if (
+          title.indexOf('just a moment') !== -1 ||
+          title.indexOf('cloudflare') !== -1 ||
+          title.indexOf('attention required') !== -1 ||
+          href.indexOf('challenge-platform') !== -1 ||
+          href.indexOf('challenges.cloudflare') !== -1 ||
+          document.getElementById('challenge-running') ||
+          document.getElementById('challenge-stage') ||
+          document.querySelector('.cf-turnstile')
+        ) {
+          return;
+        }
+
         // Strip target="_blank" from links so they don't spawn popups
         var links = document.querySelectorAll('a[target="_blank"]');
         for (var i = 0; i < links.length; i++) {
@@ -216,6 +265,23 @@ export const AD_BLOCK_JS = `
 
         for (var j = 0; j < allElems.length; j++) {
           var el = allElems[j];
+          var id = (el.id || '').toLowerCase();
+          var cls = (el.className || '').toString().toLowerCase();
+
+          // Strictly protect challenge, verification and captcha widgets
+          if (
+            id.indexOf('challenge') !== -1 ||
+            id.indexOf('cf-') !== -1 ||
+            id.indexOf('turnstile') !== -1 ||
+            id.indexOf('captcha') !== -1 ||
+            cls.indexOf('challenge') !== -1 ||
+            cls.indexOf('cf-') !== -1 ||
+            cls.indexOf('turnstile') !== -1 ||
+            cls.indexOf('captcha') !== -1
+          ) {
+            continue;
+          }
+
           var style = window.getComputedStyle(el);
           var pos = style.position;
           var z = parseInt(style.zIndex, 10);
@@ -339,6 +405,20 @@ export function shouldBlockUrl(url: string): boolean {
 
   // Don't block data or about URLs
   if (lowerUrl.startsWith('data:') || lowerUrl.startsWith('about:')) return false;
+
+  // Never block essential verification, challenge and captcha providers
+  if (
+    lowerUrl.includes('cloudflare.com') ||
+    lowerUrl.includes('challenges.cloudflare.com') ||
+    lowerUrl.includes('cloudflareinsights.com') ||
+    lowerUrl.includes('hcaptcha.com') ||
+    lowerUrl.includes('recaptcha') ||
+    lowerUrl.includes('gstatic.com') ||
+    lowerUrl.includes('arkoselabs') ||
+    lowerUrl.includes('geetest')
+  ) {
+    return false;
+  }
 
   return AD_BLOCK_RULES.some(rule => {
     const domain = rule.replace('*.', '').replace('*', '');

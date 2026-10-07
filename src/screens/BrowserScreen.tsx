@@ -239,6 +239,22 @@ export function BrowserScreen() {
             targetHost.includes('dropbox.com') ||
             targetHost.includes('github.com');
 
+          const isChallengeOrVerificationHost =
+            targetHost.includes('cloudflare.com') ||
+            targetHost.includes('challenges.cloudflare.com') ||
+            targetHost.includes('cloudflareinsights.com') ||
+            targetHost.includes('hcaptcha.com') ||
+            targetHost.includes('recaptcha.net') ||
+            targetHost.includes('google.com') ||
+            targetHost.includes('gstatic.com') ||
+            targetHost.includes('arkoselabs.com') ||
+            targetHost.includes('geetest.com');
+
+          // NEVER block verification & challenge iframes or scripts
+          if (isChallengeOrVerificationHost) {
+            return true;
+          }
+
           // If an iframe tries to navigate to an unknown third-party domain: BLOCK
           if (!isTopFrame && !isTrustedMediaHost) {
             setBlockedCount(prev => prev + 1);
@@ -474,16 +490,17 @@ export function BrowserScreen() {
           true;
         `}
         injectedJavaScript={injectedJS}
-        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
-        injectedJavaScriptForMainFrameOnly={false}
+        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={true}
+        injectedJavaScriptForMainFrameOnly={true}
         allowsBackForwardNavigationGestures
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
         javaScriptEnabled
         domStorageEnabled
+        thirdPartyCookiesEnabled={true}
+        sharedCookiesEnabled={true}
         startInLoadingState
         decelerationRate="normal"
-        sharedCookiesEnabled
         userAgent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
         renderLoading={() => (
           <View style={styles.loadingOverlay}>
