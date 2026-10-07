@@ -137,6 +137,20 @@ const splashStyles = StyleSheet.create({
   },
 });
 
+import { ErrorBoundary } from './src/components/ErrorBoundary';
+
+// Global uncaught exception safeguard to prevent iOS app from terminating
+if (typeof (globalThis as any).ErrorUtils !== 'undefined') {
+  const originalHandler = (globalThis as any).ErrorUtils.getGlobalHandler();
+  (globalThis as any).ErrorUtils.setGlobalHandler((error: any, isFatal?: boolean) => {
+    console.warn('[Global Crash Guard] Intercepted runtime exception (prevented exit):', error?.message || error);
+    // Keep app alive for non-system crashes
+    if (!isFatal && originalHandler) {
+      originalHandler(error, isFatal);
+    }
+  });
+}
+
 // Main App
 function App(): React.JSX.Element {
   const [showSplash, setShowSplash] = useState(true);
@@ -146,12 +160,14 @@ function App(): React.JSX.Element {
   }
 
   return (
-    <SafeAreaProvider>
-      <StatusBar barStyle="light-content" />
-      <DownloadProvider>
-        <AppNavigator />
-      </DownloadProvider>
-    </SafeAreaProvider>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <StatusBar barStyle="light-content" />
+        <DownloadProvider>
+          <AppNavigator />
+        </DownloadProvider>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
 

@@ -257,15 +257,12 @@ export function isDownloadableUrl(url: string): boolean {
       }
     }
 
-    // 5. Check specific file hosting and download server URL patterns
+    // 5. Check specific direct download server URL patterns
     const hostname = parsed.hostname.toLowerCase();
     if (
       (parsed.searchParams.has('export') && parsed.searchParams.get('export') === 'download') ||
       parsed.searchParams.get('response-content-disposition')?.includes('attachment') ||
-      (hostname.includes('pixeldrain.com') && path.startsWith('/api/file/')) ||
-      (hostname.includes('gofile.io') && path.startsWith('/download/')) ||
-      (hostname.includes('mediafire.com') && path.includes('/file/')) ||
-      (hostname.includes('hubcloud') && (path.includes('/drive/') || path.includes('/download/')))
+      (hostname.includes('pixeldrain.com') && path.startsWith('/api/file/'))
     ) {
       return true;
     }

@@ -22,6 +22,7 @@ import { storage, Bookmark } from '../services/storage';
 import { isValidUrl, isDownloadableUrl, normalizeUrl } from '../utils/fileUtils';
 import { AD_HIDE_CSS, AD_BLOCK_JS, shouldBlockUrl } from '../utils/adBlocker';
 import { AddDownloadModal } from '../components/AddDownloadModal';
+import { ErrorBoundary } from '../components/ErrorBoundary';
 
 const SEARCH_ENGINES = {
   google: 'https://www.google.com/search?q=',
@@ -30,11 +31,6 @@ const SEARCH_ENGINES = {
 };
 
 const DEFAULT_HOME = 'https://duckduckgo.com/';
-
-const IOS_SAFARI_USER_AGENT =
-  Platform.OS === 'ios'
-    ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
-    : undefined;
 
 export function BrowserScreen() {
   const { startDownload, settings } = useDownloads();
@@ -126,13 +122,17 @@ export function BrowserScreen() {
       setPageTitle(navState.title);
     }
 
-    // Add to history
+    // Add to history safely
     if (navState.url && navState.title) {
-      storage.addToHistory({
-        url: navState.url,
-        title: navState.title,
-        visitedAt: new Date().toISOString(),
-      });
+      storage
+        .addToHistory({
+          url: navState.url,
+          title: navState.title,
+          visitedAt: new Date().toISOString(),
+        })
+        .catch(err => {
+          console.warn('[BrowserScreen] addToHistory error:', err);
+        });
     }
   };
 
@@ -154,141 +154,146 @@ export function BrowserScreen() {
   };
 
   const handleShouldStartLoad = (event: any): boolean => {
-    const { url, isTopFrame, target, navigationType } = event;
-    if (!url) return false;
+    try {
+      const { url, isTopFrame, target, navigationType } = event;
+      if (!url) return false;
 
-    const lower = url.toLowerCase();
+      const lower = url.toLowerCase();
 
-    // 1. Allow internal browser frames, workers, and data URIs essential for Turnstile / modern web apps
-    if (
-      lower.startsWith('about:blank') ||
-      lower.startsWith('about:srcdoc') ||
-      lower.startsWith('blob:') ||
-      lower.startsWith('data:image/') ||
-      lower.startsWith('data:font/') ||
-      lower.startsWith('data:application/') ||
-      lower.startsWith('data:text/css') ||
-      (lower.startsWith('about:') && isTopFrame)
-    ) {
-      return true;
-    }
-
-    // 2. Safe handling of non-HTTP protocols (prevents native iOS WebKit unhandled scheme crashes)
-    if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
-      // Handle Magnet torrent links gracefully: copy to clipboard and notify user
-      if (lower.startsWith('magnet:')) {
-        try {
-          const { Clipboard } = require('react-native');
-          if (Clipboard && Clipboard.setString) {
-            Clipboard.setString(url);
-          }
-          showToast('📋 Magnet link copied to clipboard');
-        } catch {}
-        return false;
-      }
-
-      // Block rogue store / ad-network / intent schemes
+      // 1. Allow internal browser frames, workers, and data URIs essential for Turnstile / modern web apps
       if (
-        lower.startsWith('itms-app') ||
-        lower.startsWith('itms-services') ||
-        lower.startsWith('itms:') ||
-        lower.startsWith('market:') ||
-        lower.startsWith('intent:') ||
-        lower.startsWith('javascript:')
+        lower.startsWith('about:blank') ||
+        lower.startsWith('about:srcdoc') ||
+        lower.startsWith('blob:') ||
+        lower.startsWith('data:image/') ||
+        lower.startsWith('data:font/') ||
+        lower.startsWith('data:application/') ||
+        lower.startsWith('data:text/css') ||
+        (lower.startsWith('about:') && isTopFrame)
       ) {
+        return true;
+      }
+
+      // 2. Safe handling of non-HTTP protocols (prevents native iOS WebKit unhandled scheme crashes)
+      if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
+        // Handle Magnet torrent links gracefully
+        if (lower.startsWith('magnet:')) {
+          try {
+            const { Clipboard } = require('react-native');
+            if (Clipboard && Clipboard.setString) {
+              Clipboard.setString(url);
+            }
+            setTimeout(() => {
+              showToast('📋 Magnet link copied to clipboard');
+            }, 10);
+          } catch {}
+          return false;
+        }
+
+        // Safe external app links (mailto, tel)
+        if (lower.startsWith('mailto:') || lower.startsWith('tel:')) {
+          try {
+            Linking.openURL(url).catch(() => {});
+          } catch {}
+          return false;
+        }
+
+        // Silently ignore other custom schemes without calling Linking
+        // (prevents OSStatus error -10814 native crashes on iOS for unknown schemes)
         return false;
       }
 
-      // Safe external app links (e.g. Telegram, WhatsApp, tel, mailto)
-      try {
-        Linking.canOpenURL(url).then(supported => {
-          if (supported) {
-            Linking.openURL(url).catch(() => {});
-          }
-        }).catch(() => {});
-      } catch {}
+      // 3. ALWAYS allow Cloudflare Turnstile, hCaptcha, challenge platform & clearance tokens
+      const isChallengeUrl =
+        lower.includes('cdn-cgi/challenge') ||
+        lower.includes('challenge-platform') ||
+        lower.includes('__cf_chl_') ||
+        lower.includes('cloudflare.com') ||
+        lower.includes('challenges.cloudflare.com') ||
+        lower.includes('cloudflareinsights.com') ||
+        lower.includes('hcaptcha.com') ||
+        lower.includes('recaptcha') ||
+        lower.includes('gstatic.com') ||
+        lower.includes('arkoselabs') ||
+        lower.includes('geetest');
 
-      return false;
-    }
+      if (isChallengeUrl) {
+        return true;
+      }
 
-    // 3. NEVER block verification & challenge iframes or scripts (Cloudflare Turnstile, hCaptcha, etc.)
-    const isChallengeOrVerificationHost =
-      lower.includes('cloudflare.com') ||
-      lower.includes('challenges.cloudflare.com') ||
-      lower.includes('cloudflareinsights.com') ||
-      lower.includes('hcaptcha.com') ||
-      lower.includes('recaptcha') ||
-      lower.includes('gstatic.com') ||
-      lower.includes('arkoselabs') ||
-      lower.includes('geetest');
+      const safeUrl = normalizeUrl(url);
 
-    if (isChallengeOrVerificationHost) {
-      return true;
-    }
+      // 4. Block known ad networks, trackers, and popup redirect domains
+      if (settings.adBlockEnabled && (shouldBlockUrl(url) || shouldBlockUrl(safeUrl))) {
+        setTimeout(() => {
+          setBlockedCount(prev => prev + 1);
+        }, 10);
+        return false;
+      }
 
-    const safeUrl = normalizeUrl(url);
+      // 5. Check if it's a direct downloadable media/archive file
+      if (isDownloadableUrl(safeUrl)) {
+        setTimeout(() => {
+          setPendingDownloadUrl(safeUrl);
+          setShowDownloadModal(true);
+        }, 10);
+        return false;
+      }
 
-    // 4. Block known ad networks, trackers, and popup redirect domains
-    if (settings.adBlockEnabled && (shouldBlockUrl(url) || shouldBlockUrl(safeUrl))) {
-      setBlockedCount(prev => prev + 1);
-      return false;
-    }
+      // 6. Smart Popup / Popunder / Tab-under protection:
+      if (settings.adBlockEnabled && currentUrl && currentUrl.startsWith('http')) {
+        try {
+          const currentHost = new URL(normalizeUrl(currentUrl)).hostname.replace(/^www\./, '');
+          const targetHost = new URL(safeUrl).hostname.replace(/^www\./, '');
 
-    // 5. Check if it's a direct downloadable file (.mp4, .mkv, .zip, etc.)
-    if (isDownloadableUrl(safeUrl)) {
-      setPendingDownloadUrl(safeUrl);
-      setShowDownloadModal(true);
-      return false;
-    }
+          if (targetHost && targetHost !== currentHost) {
+            const isTrustedMediaHost = 
+              targetHost.includes('drive.google.com') ||
+              targetHost.includes('mediafire.com') ||
+              targetHost.includes('mega.nz') ||
+              targetHost.includes('pixeldrain.com') ||
+              targetHost.includes('gofile.io') ||
+              targetHost.includes('hubcloud') ||
+              targetHost.includes('gdflix') ||
+              targetHost.includes('fastdl') ||
+              targetHost.includes('1cloud') ||
+              targetHost.includes('streamtape') ||
+              targetHost.includes('doodstream') ||
+              targetHost.includes('dropbox.com') ||
+              targetHost.includes('github.com');
 
-    // 6. Smart Popup / Popunder / Tab-under protection:
-    if (settings.adBlockEnabled && currentUrl && currentUrl.startsWith('http')) {
-      try {
-        const currentHost = new URL(normalizeUrl(currentUrl)).hostname.replace(/^www\./, '');
-        const targetHost = new URL(safeUrl).hostname.replace(/^www\./, '');
-
-        if (targetHost && targetHost !== currentHost) {
-          const isTrustedMediaHost = 
-            targetHost.includes('drive.google.com') ||
-            targetHost.includes('mediafire.com') ||
-            targetHost.includes('mega.nz') ||
-            targetHost.includes('pixeldrain.com') ||
-            targetHost.includes('gofile.io') ||
-            targetHost.includes('hubcloud') ||
-            targetHost.includes('gdflix') ||
-            targetHost.includes('fastdl') ||
-            targetHost.includes('1cloud') ||
-            targetHost.includes('streamtape') ||
-            targetHost.includes('doodstream') ||
-            targetHost.includes('dropbox.com') ||
-            targetHost.includes('github.com');
-
-          // If an iframe tries to navigate to an unknown third-party domain: BLOCK
-          if (!isTopFrame && !isTrustedMediaHost) {
-            setBlockedCount(prev => prev + 1);
-            return false;
-          }
-
-          // If it is a direct user click on a link:
-          // ALLOW IT! The user clicked "Download" or a movie link, so it must forward.
-          if (navigationType === 'click') {
-            return true;
-          }
-
-          // If navigationType is 'other' (unprompted background JS redirect) and not trusted:
-          // Block rogue popunder redirects
-          if (navigationType === 'other' && !isTrustedMediaHost && !isDownloadableUrl(safeUrl)) {
-            const isSearchOrHome = url === DEFAULT_HOME || targetHost.includes('google.com') || targetHost.includes('duckduckgo.com');
-            if (!isSearchOrHome) {
-              setBlockedCount(prev => prev + 1);
+            // If an iframe tries to navigate to an unknown third-party domain: BLOCK
+            if (!isTopFrame && !isTrustedMediaHost) {
+              setTimeout(() => {
+                setBlockedCount(prev => prev + 1);
+              }, 10);
               return false;
             }
-          }
-        }
-      } catch (e) {}
-    }
 
-    return true;
+            // Direct user clicks: ALWAYS allow
+            if (navigationType === 'click') {
+              return true;
+            }
+
+            // Script-triggered background popunders: BLOCK
+            if (navigationType === 'other' && !isTrustedMediaHost && !isDownloadableUrl(safeUrl)) {
+              const isSearchOrHome = url === DEFAULT_HOME || targetHost.includes('google.com') || targetHost.includes('duckduckgo.com');
+              if (!isSearchOrHome) {
+                setTimeout(() => {
+                  setBlockedCount(prev => prev + 1);
+                }, 10);
+                return false;
+              }
+            }
+          }
+        } catch (e) {}
+      }
+
+      return true;
+    } catch (err) {
+      console.warn('[BrowserScreen] handleShouldStartLoad safe fallback:', err);
+      return true;
+    }
   };
 
   const handleDownload = async (url: string, fileName?: string) => {
@@ -348,7 +353,11 @@ export function BrowserScreen() {
   });
 
   return (
-    <SafeAreaView style={styles.screen} edges={['top']}>
+    <ErrorBoundary
+      fallbackMessage="The browser encountered an error on this page, but your downloads are safe."
+      onReset={() => webViewRef.current?.reload()}
+    >
+      <SafeAreaView style={styles.screen} edges={['top']}>
       {/* URL Bar */}
       <View style={styles.toolbar}>
         <View style={styles.navButtons}>
@@ -471,12 +480,21 @@ export function BrowserScreen() {
         ref={webViewRef}
         source={{ uri: currentUrl }}
         style={styles.webview}
+        originWhitelist={['*']}
         onNavigationStateChange={handleNavigationChange}
         onShouldStartLoadWithRequest={handleShouldStartLoad}
         onMessage={handleWebViewMessage}
         onLoadStart={() => setIsLoading(true)}
         onLoadEnd={() => setIsLoading(false)}
         onLoadProgress={({ nativeEvent }) => setProgress(nativeEvent.progress)}
+        onError={(syntheticEvent) => {
+          const { nativeEvent } = syntheticEvent;
+          console.warn('[WebView Error]', nativeEvent?.description || nativeEvent);
+        }}
+        onHttpError={(syntheticEvent) => {
+          const { nativeEvent } = syntheticEvent;
+          console.warn('[WebView HttpError]', nativeEvent?.statusCode);
+        }}
         onContentProcessDidTerminate={() => {
           console.warn('WebView content process terminated, recovering...');
           webViewRef.current?.reload();
@@ -488,22 +506,38 @@ export function BrowserScreen() {
         }}
         setSupportMultipleWindows={false}
         javaScriptCanOpenWindowsAutomatically={false}
-        injectedJavaScriptBeforeContentLoaded={`
-          ${injectedJS}
-          try {
-            var style = document.createElement('style');
-            style.textContent = \`${injectedCSS.replace(/`/g, '\\`')}\`;
-            if (document.head) {
-              document.head.appendChild(style);
-            } else {
-              document.addEventListener('DOMContentLoaded', function() {
-                if (document.head) document.head.appendChild(style);
-              });
-            }
-          } catch(e) {}
-          true;
-        `}
-        injectedJavaScript={injectedJS}
+        injectedJavaScriptBeforeContentLoaded={
+          settings.adBlockEnabled
+            ? `
+              (function() {
+                try {
+                  var host = (window.location && window.location.hostname ? window.location.hostname : '').toLowerCase();
+                  var href = (window.location && window.location.href ? window.location.href : '').toLowerCase();
+                  if (
+                    host.indexOf('cloudflare.com') !== -1 ||
+                    href.indexOf('challenge-platform') !== -1 ||
+                    href.indexOf('cdn-cgi/challenge') !== -1 ||
+                    href.indexOf('__cf_chl_') !== -1
+                  ) {
+                    return;
+                  }
+                  ${injectedJS}
+                  var style = document.createElement('style');
+                  style.textContent = \`${injectedCSS.replace(/`/g, '\\`')}\`;
+                  if (document.head) {
+                    document.head.appendChild(style);
+                  } else {
+                    document.addEventListener('DOMContentLoaded', function() {
+                      if (document.head) document.head.appendChild(style);
+                    });
+                  }
+                } catch(e) {}
+              })();
+              true;
+            `
+            : undefined
+        }
+        injectedJavaScript={settings.adBlockEnabled ? injectedJS : undefined}
         injectedJavaScriptBeforeContentLoadedForMainFrameOnly={true}
         injectedJavaScriptForMainFrameOnly={true}
         allowsBackForwardNavigationGestures
@@ -515,7 +549,7 @@ export function BrowserScreen() {
         sharedCookiesEnabled={true}
         startInLoadingState
         decelerationRate="normal"
-        userAgent={IOS_SAFARI_USER_AGENT}
+        applicationNameForUserAgent="Safari/604.1"
         renderLoading={() => (
           <View style={styles.loadingOverlay}>
             <ActivityIndicator size="large" color={Colors.primary} />
@@ -610,7 +644,8 @@ export function BrowserScreen() {
         onStartDownload={handleDownload}
         initialUrl={pendingDownloadUrl}
       />
-    </SafeAreaView>
+      </SafeAreaView>
+    </ErrorBoundary>
   );
 }
 
