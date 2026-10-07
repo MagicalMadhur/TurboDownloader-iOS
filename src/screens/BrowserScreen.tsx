@@ -12,6 +12,7 @@ import {
   Share,
   BackHandler,
   Linking,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { WebView } from 'react-native-webview';
@@ -29,6 +30,11 @@ const SEARCH_ENGINES = {
 };
 
 const DEFAULT_HOME = 'https://duckduckgo.com/';
+
+const IOS_SAFARI_USER_AGENT =
+  Platform.OS === 'ios'
+    ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1'
+    : undefined;
 
 export function BrowserScreen() {
   const { startDownload, settings } = useDownloads();
@@ -153,13 +159,22 @@ export function BrowserScreen() {
 
     const lower = url.toLowerCase();
 
-    // 1. Safe handling of non-HTTP protocols (prevents native iOS WebKit unhandled scheme crashes)
-    if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
-      // Top-frame about:blank is permitted for initialization
-      if (lower.startsWith('about:blank') && isTopFrame) {
-        return true;
-      }
+    // 1. Allow internal browser frames, workers, and data URIs essential for Turnstile / modern web apps
+    if (
+      lower.startsWith('about:blank') ||
+      lower.startsWith('about:srcdoc') ||
+      lower.startsWith('blob:') ||
+      lower.startsWith('data:image/') ||
+      lower.startsWith('data:font/') ||
+      lower.startsWith('data:application/') ||
+      lower.startsWith('data:text/css') ||
+      (lower.startsWith('about:') && isTopFrame)
+    ) {
+      return true;
+    }
 
+    // 2. Safe handling of non-HTTP protocols (prevents native iOS WebKit unhandled scheme crashes)
+    if (!lower.startsWith('http://') && !lower.startsWith('https://')) {
       // Handle Magnet torrent links gracefully: copy to clipboard and notify user
       if (lower.startsWith('magnet:')) {
         try {
@@ -172,17 +187,14 @@ export function BrowserScreen() {
         return false;
       }
 
-      // Block rogue / ad-network schemes
+      // Block rogue store / ad-network / intent schemes
       if (
         lower.startsWith('itms-app') ||
         lower.startsWith('itms-services') ||
-        lower.startsWith('itms') ||
+        lower.startsWith('itms:') ||
         lower.startsWith('market:') ||
         lower.startsWith('intent:') ||
-        lower.startsWith('javascript:') ||
-        lower.startsWith('blob:') ||
-        lower.startsWith('data:') ||
-        lower.startsWith('about:')
+        lower.startsWith('javascript:')
       ) {
         return false;
       }
@@ -196,28 +208,40 @@ export function BrowserScreen() {
         }).catch(() => {});
       } catch {}
 
-      // CRITICAL: NEVER allow WKWebView to navigate to any non-http(s) scheme natively!
       return false;
+    }
+
+    // 3. NEVER block verification & challenge iframes or scripts (Cloudflare Turnstile, hCaptcha, etc.)
+    const isChallengeOrVerificationHost =
+      lower.includes('cloudflare.com') ||
+      lower.includes('challenges.cloudflare.com') ||
+      lower.includes('cloudflareinsights.com') ||
+      lower.includes('hcaptcha.com') ||
+      lower.includes('recaptcha') ||
+      lower.includes('gstatic.com') ||
+      lower.includes('arkoselabs') ||
+      lower.includes('geetest');
+
+    if (isChallengeOrVerificationHost) {
+      return true;
     }
 
     const safeUrl = normalizeUrl(url);
 
-    // 2. Check if URL should be blocked (ads, popunders, redirects)
+    // 4. Block known ad networks, trackers, and popup redirect domains
     if (settings.adBlockEnabled && (shouldBlockUrl(url) || shouldBlockUrl(safeUrl))) {
       setBlockedCount(prev => prev + 1);
       return false;
     }
 
-    // 3. Check if it's a downloadable file
+    // 5. Check if it's a direct downloadable file (.mp4, .mkv, .zip, etc.)
     if (isDownloadableUrl(safeUrl)) {
       setPendingDownloadUrl(safeUrl);
       setShowDownloadModal(true);
       return false;
     }
 
-    // 4. Brave-style Popup & Tab-under protection:
-    // If navigation comes from a click or script in an iframe or target='_blank'
-    // and points to a completely different untrusted domain:
+    // 6. Smart Popup / Popunder / Tab-under protection:
     if (settings.adBlockEnabled && currentUrl && currentUrl.startsWith('http')) {
       try {
         const currentHost = new URL(normalizeUrl(currentUrl)).hostname.replace(/^www\./, '');
@@ -239,31 +263,21 @@ export function BrowserScreen() {
             targetHost.includes('dropbox.com') ||
             targetHost.includes('github.com');
 
-          const isChallengeOrVerificationHost =
-            targetHost.includes('cloudflare.com') ||
-            targetHost.includes('challenges.cloudflare.com') ||
-            targetHost.includes('cloudflareinsights.com') ||
-            targetHost.includes('hcaptcha.com') ||
-            targetHost.includes('recaptcha.net') ||
-            targetHost.includes('google.com') ||
-            targetHost.includes('gstatic.com') ||
-            targetHost.includes('arkoselabs.com') ||
-            targetHost.includes('geetest.com');
-
-          // NEVER block verification & challenge iframes or scripts
-          if (isChallengeOrVerificationHost) {
-            return true;
-          }
-
           // If an iframe tries to navigate to an unknown third-party domain: BLOCK
           if (!isTopFrame && !isTrustedMediaHost) {
             setBlockedCount(prev => prev + 1);
             return false;
           }
 
-          // If navigationType is 'other' or target is '_blank' and not trusted:
-          // This is a classic movie site popunder / tab-under!
-          if ((target === '_blank' || navigationType === 'other') && !isTrustedMediaHost && !isDownloadableUrl(safeUrl)) {
+          // If it is a direct user click on a link:
+          // ALLOW IT! The user clicked "Download" or a movie link, so it must forward.
+          if (navigationType === 'click') {
+            return true;
+          }
+
+          // If navigationType is 'other' (unprompted background JS redirect) and not trusted:
+          // Block rogue popunder redirects
+          if (navigationType === 'other' && !isTrustedMediaHost && !isDownloadableUrl(safeUrl)) {
             const isSearchOrHome = url === DEFAULT_HOME || targetHost.includes('google.com') || targetHost.includes('duckduckgo.com');
             if (!isSearchOrHome) {
               setBlockedCount(prev => prev + 1);
@@ -501,7 +515,7 @@ export function BrowserScreen() {
         sharedCookiesEnabled={true}
         startInLoadingState
         decelerationRate="normal"
-        applicationNameForUserAgent="Version/18.0 Mobile/15E148 Safari/604.1"
+        userAgent={IOS_SAFARI_USER_AGENT}
         renderLoading={() => (
           <View style={styles.loadingOverlay}>
             <ActivityIndicator size="large" color={Colors.primary} />

@@ -17,6 +17,8 @@ export const AD_BLOCK_RULES = [
   'partner.googleadservices.com',
   '*.adchoices.com',
   '*.youradchoices.com',
+  '*.aboutads.info',
+  '*.youronlinechoices.com',
   '*.amazon-adsystem.com',
 
   // Facebook & Social Trackers
@@ -131,14 +133,16 @@ export const AD_BLOCK_RULES = [
   '*.whos.amung.us',
 ];
 
-// CSS injection to hide ads, banners, and clickjack overlays
+// CSS injection to hide ads, banners, AdChoices, and popunders cleanly
 export const AD_HIDE_CSS = `
   /* AdChoices, Google Ads, Sponsored Banners */
   [class*="adchoices"], [id*="adchoices"],
   [class*="ad-choices"], [id*="ad-choices"],
-  a[href*="adchoices"], a[href*="youradchoices"],
-  img[src*="adchoices"],
+  a[href*="adchoices"], a[href*="youradchoices"], a[href*="aboutads.info"], a[href*="youronlinechoices"],
+  img[src*="adchoices"], svg[class*="adchoices"], [aria-label*="AdChoices"], [title*="AdChoices"],
+  [data-adchoices], [data-ad-feedback], [data-google-av-cxn], [data-google-av-adk],
   [id*="google_ads"], [class*="google_ads"],
+  div[id*="google_ads_iframe"], iframe[id*="google_ads_iframe"],
   [id*="aswift_"], iframe[id*="aswift_"], iframe[name*="aswift_"],
   .adsbygoogle, ins.adsbygoogle,
   div[data-google-query-id],
@@ -146,15 +150,14 @@ export const AD_HIDE_CSS = `
   div[class*="ad_unit"], div[id*="ad_unit"],
   div[class*="ad_wrapper"], div[id*="ad_wrapper"],
   div[class*="ad_container"], div[id*="ad_container"],
-  div[class*="native-ad"], div[class*="sponsored-ad"],
+  div[class*="native-ad"], div[class*="sponsored-ad"], div[data-native-ad], div[class*="gemini-ad"],
   div[class*="taboola"], div[id*="taboola"],
   div[class*="outbrain"], div[id*="outbrain"],
   div[class*="mgid"], div[id*="mgid"],
   div[class*="adthrive"], div[class*="mediavine"],
   div[class*="banner-ad"], div[class*="ad-banner"],
-  [class*="ad-"], [class*="ads-"], [class*="advert"],
-  [id*="ad-"], [id*="ads-"], [id*="advert"],
-  [class*="banner"], [class*="sponsor"],
+  [class*="ad-box"], [id*="ad-box"], [class*="ad-slot"], [id*="ad-slot"],
+  [class*="sponsored"], [id*="sponsored"],
   iframe[src*="doubleclick"], iframe[src*="pop"],
   iframe[src*="/ads/"], iframe[src*="adservice"], iframe[src*="adserver"], iframe[src*="ads."],
   div[data-ad], div[data-ads], div[data-advert],
@@ -165,7 +168,9 @@ export const AD_HIDE_CSS = `
   .ad-placeholder,
   div[class*="popunder"], div[id*="popunder"],
   div[class*="overlay"][style*="z-index: 999"],
-  div[class*="overlay"][style*="z-index:999"] {
+  div[class*="overlay"][style*="z-index:999"],
+  div[class*="overlay"][style*="z-index: 1000"],
+  div[class*="overlay"][style*="z-index:1000"] {
     display: none !important;
     visibility: hidden !important;
     height: 0 !important;
@@ -175,9 +180,11 @@ export const AD_HIDE_CSS = `
   }
 
   /* Never hide Cloudflare, Turnstile, Captcha challenge frames & backdrops */
-  #challenge-stage, #challenge-running, [id*="challenge"], [class*="challenge"],
+  #challenge-stage, #challenge-running, #challenge-form, #turnstile-wrapper,
+  [id*="challenge"], [class*="challenge"],
   [id*="cf-"], [class*="cf-"], [id*="turnstile"], [class*="turnstile"],
-  iframe[src*="cloudflare"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"] {
+  [name*="cf-turnstile"], [data-sitekey],
+  iframe[src*="cloudflare"], iframe[src*="challenges"], iframe[src*="turnstile"], iframe[src*="hcaptcha"], iframe[src*="recaptcha"] {
     display: block !important;
     visibility: visible !important;
     height: auto !important;
@@ -187,8 +194,9 @@ export const AD_HIDE_CSS = `
   }
 `;
 
-// Advanced script to run BEFORE and DURING page execution
-// Neutralizes popups, click-jacking, popunders, and intercepts media streams
+// Advanced script to run in the WebView
+// Completely avoids mutating the DOM during Cloudflare Turnstile bot challenges
+// to guarantee fast, zero-loop challenge completion
 export const AD_BLOCK_JS = `
   (function() {
     'use strict';
@@ -196,17 +204,34 @@ export const AD_BLOCK_JS = `
     // Helper: detect if page is currently undergoing a Cloudflare or Bot Challenge
     function isChallengeActive() {
       try {
+        var host = (window.location && window.location.hostname ? window.location.hostname : '').toLowerCase();
+        if (host.indexOf('cloudflare.com') !== -1 || host.indexOf('challenges.cloudflare') !== -1) {
+          return true;
+        }
         var title = (document.title || '').toLowerCase();
-        var href = (window.location && window.location.href ? window.location.href : '').toLowerCase();
-        return (
+        if (
           title.indexOf('just a moment') !== -1 ||
           title.indexOf('cloudflare') !== -1 ||
-          title.indexOf('attention required') !== -1 ||
+          title.indexOf('attention required') !== -1
+        ) {
+          return true;
+        }
+        var href = (window.location && window.location.href ? window.location.href : '').toLowerCase();
+        if (
           href.indexOf('challenge-platform') !== -1 ||
           href.indexOf('challenges.cloudflare') !== -1 ||
+          href.indexOf('cdn-cgi/challenge') !== -1
+        ) {
+          return true;
+        }
+        return (
           !!document.getElementById('challenge-running') ||
           !!document.getElementById('challenge-stage') ||
+          !!document.getElementById('challenge-form') ||
+          !!document.getElementById('turnstile-wrapper') ||
           !!document.querySelector('.cf-turnstile') ||
+          !!document.querySelector('[name*="cf-turnstile"]') ||
+          !!document.querySelector('iframe[src*="challenges.cloudflare"]') ||
           !!document.querySelector('iframe[src*="cloudflare"]')
         );
       } catch(e) {
@@ -214,60 +239,9 @@ export const AD_BLOCK_JS = `
       }
     }
 
-    // Clean Clickjacking Overlays & Link targets
-    function sanitizeDOM() {
-      if (isChallengeActive()) return;
-
-      try {
-        // Strip target="_blank" from links so they don't spawn popups
-        var links = document.querySelectorAll('a[target="_blank"]');
-        for (var i = 0; i < links.length; i++) {
-          links[i].removeAttribute('target');
-        }
-
-        // Detect full-screen invisible clickjacking overlays
-        var allElems = document.querySelectorAll('div, a, span, section');
-        var winW = window.innerWidth || document.documentElement.clientWidth;
-        var winH = window.innerHeight || document.documentElement.clientHeight;
-
-        for (var j = 0; j < allElems.length; j++) {
-          var el = allElems[j];
-          var id = (el.id || '').toLowerCase();
-          var cls = (el.className || '').toString().toLowerCase();
-
-          // Strictly protect challenge, verification and captcha widgets
-          if (
-            id.indexOf('challenge') !== -1 ||
-            id.indexOf('cf-') !== -1 ||
-            id.indexOf('turnstile') !== -1 ||
-            id.indexOf('captcha') !== -1 ||
-            cls.indexOf('challenge') !== -1 ||
-            cls.indexOf('cf-') !== -1 ||
-            cls.indexOf('turnstile') !== -1 ||
-            cls.indexOf('captcha') !== -1
-          ) {
-            continue;
-          }
-
-          var style = window.getComputedStyle(el);
-          var pos = style.position;
-          var z = parseInt(style.zIndex, 10);
-
-          if ((pos === 'fixed' || pos === 'absolute') && z >= 900) {
-            var rect = el.getBoundingClientRect();
-            if (rect.width >= winW * 0.7 && rect.height >= winH * 0.7) {
-              var op = parseFloat(style.opacity);
-              var bg = style.backgroundColor;
-              if (op < 0.1 || bg === 'transparent' || bg.indexOf('rgba(0, 0, 0, 0)') !== -1) {
-                if (el.parentNode) {
-                  console.log('[TurboDownloader] Removed clickjacking overlay');
-                  el.parentNode.removeChild(el);
-                }
-              }
-            }
-          }
-        }
-      } catch(err) {}
+    // If an active challenge is taking place, exit immediately to never interfere with proof-of-work
+    if (isChallengeActive()) {
+      return;
     }
 
     // Media Sniffer (IDM style) - Detects video sources for easy 1-tap download
@@ -300,7 +274,7 @@ export const AD_BLOCK_JS = `
       } catch(e) {}
     }
 
-    // Hook play event to capture streams right when they start
+    // Hook play event to capture streams right when playback begins
     try {
       document.addEventListener('play', function(e) {
         if (e.target && (e.target.tagName === 'VIDEO' || e.target.tagName === 'AUDIO')) {
@@ -316,21 +290,14 @@ export const AD_BLOCK_JS = `
       }, true);
     } catch(e) {}
 
-    // Periodic sweep (pauses during challenge)
-    function runSweep() {
-      if (isChallengeActive()) return;
-      sanitizeDOM();
+    // Sniff once after DOM is ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', sniffMedia);
+    } else {
       sniffMedia();
     }
 
-    setInterval(runSweep, 1000);
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', runSweep);
-    } else {
-      runSweep();
-    }
-
-    // Capture clicks: clean overlays and intercept direct file download clicks
+    // Capture direct media file clicks for download modal
     document.addEventListener('click', function(e) {
       if (isChallengeActive()) return;
 
@@ -344,7 +311,7 @@ export const AD_BLOCK_JS = `
           if (href && href.startsWith('http')) {
             var lowerHref = href.toLowerCase();
             var hasDownloadAttr = el.hasAttribute('download');
-            var isDirectFile = /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)(\?|#|$)/i.test(href);
+            var isDirectFile = /\\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|3gp|mp3|wav|flac|aac|zip|rar|7z|tar|gz|iso|apk|ipa|pdf)(\\?|#|$)/i.test(href);
             var isWebPage = lowerHref.endsWith('.html') || lowerHref.endsWith('.htm') || lowerHref.endsWith('.php');
 
             if (isDirectFile || (hasDownloadAttr && !isWebPage)) {
@@ -374,8 +341,14 @@ export function shouldBlockUrl(url: string): boolean {
   if (!url) return false;
   const lowerUrl = url.toLowerCase();
 
-  // Don't block data or about URLs
-  if (lowerUrl.startsWith('data:') || lowerUrl.startsWith('about:')) return false;
+  // Don't block internal data, about or blob URLs
+  if (
+    lowerUrl.startsWith('data:') ||
+    lowerUrl.startsWith('about:') ||
+    lowerUrl.startsWith('blob:')
+  ) {
+    return false;
+  }
 
   // Never block essential verification, challenge and captcha providers
   if (
@@ -396,3 +369,4 @@ export function shouldBlockUrl(url: string): boolean {
     return lowerUrl.includes(domain);
   });
 }
+
