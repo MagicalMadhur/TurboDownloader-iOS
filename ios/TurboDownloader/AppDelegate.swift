@@ -30,10 +30,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
       launchOptions: launchOptions
     )
 
+    disableFileProtectionForDownloads()
+
     return true
   }
 
   func applicationDidEnterBackground(_ application: UIApplication) {
+    disableFileProtectionForDownloads()
     // If active downloads exist, start background keep-alive to prevent iOS 180s deep-sleep kill
     if hasActiveDownloads() {
       BackgroundDownloadKeeper.shared.startKeepAlive()
@@ -42,6 +45,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
   func applicationDidBecomeActive(_ application: UIApplication) {
     BackgroundDownloadKeeper.shared.stopKeepAlive()
+  }
+
+  private func disableFileProtectionForDownloads() {
+    guard let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+    let tdDir = docDir.appendingPathComponent("TurboDownloader")
+    try? FileManager.default.createDirectory(at: tdDir, withIntermediateDirectories: true, attributes: [.protectionKey: FileProtectionType.none])
+    try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: tdDir.path)
   }
 
   private func hasActiveDownloads() -> Bool {

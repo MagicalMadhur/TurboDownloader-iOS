@@ -337,8 +337,39 @@ class DownloadEngine {
     const downloadDir = this.getDownloadDir();
     const filePath = `${downloadDir}/TurboDownloader/${download.fileName}`;
     const tempPrefix = `${downloadDir}/TurboDownloader/.${id}_part_`;
+    const metaPath = `${downloadDir}/TurboDownloader/.${id}_meta.json`;
 
-    const chunkSize = Math.floor(totalSize / numThreads);
+    // 1. Enforce immutable chunk boundaries across all pauses & resumes
+    let lockedThreads = numThreads;
+    let lockedTotalSize = totalSize;
+    let lockedChunkSize = Math.floor(lockedTotalSize / lockedThreads);
+
+    try {
+      if (await ReactNativeBlobUtil.fs.exists(metaPath)) {
+        const metaStr = await ReactNativeBlobUtil.fs.readFile(metaPath, 'utf8');
+        const meta = JSON.parse(metaStr);
+        if (meta && meta.numThreads > 0 && meta.totalSize > 0) {
+          lockedThreads = meta.numThreads;
+          lockedTotalSize = meta.totalSize;
+          lockedChunkSize = meta.chunkSize || Math.floor(lockedTotalSize / lockedThreads);
+        }
+      } else if (lockedTotalSize > 0 && lockedThreads > 0) {
+        await ReactNativeBlobUtil.fs.writeFile(
+          metaPath,
+          JSON.stringify({
+            totalSize: lockedTotalSize,
+            numThreads: lockedThreads,
+            chunkSize: lockedChunkSize,
+          }),
+          'utf8'
+        );
+      }
+    } catch {}
+
+    const chunkSize = lockedChunkSize;
+    numThreads = lockedThreads;
+    totalSize = lockedTotalSize;
+
     const partPaths: string[] = [];
     const partBytes: number[] = new Array(numThreads).fill(0);
     const tasks: any[] = [];
@@ -414,10 +445,17 @@ class DownloadEngine {
           }
         } catch {}
 
-        if (existingPartBytes >= partLength) {
-          // This part is ALREADY 100% completed!
+        if (existingPartBytes === partLength) {
+          // This part is ALREADY 100% completed and bit-perfect!
           partBytes[i] = partLength;
           continue;
+        }
+
+        // If existing part was corrupted or exceeded partLength, reset it cleanly
+        if (existingPartBytes > partLength) {
+          console.warn(`Part ${i} size (${existingPartBytes}) exceeds partLength (${partLength}), resetting to clean chunk`);
+          try { await ReactNativeBlobUtil.fs.unlink(partPath); } catch {}
+          existingPartBytes = 0;
         }
 
         const isResumingPart = existingPartBytes > 0;
@@ -428,8 +466,8 @@ class DownloadEngine {
           fileCache: true,
           path: partPath,
           followRedirect: true,
-          IOSBackgroundTask: false, // Must be false to use NSURLSessionDataTask which streams bytes incrementally to disk via NSOutputStream!
-          overwrite: !isResumingPart, // overwrite: false enables native iOS [NSOutputStream initToFileAtPath:partPath append:YES]!
+          IOSBackgroundTask: false,
+          overwrite: !isResumingPart,
         };
 
         const partHeaders = {
@@ -442,7 +480,7 @@ class DownloadEngine {
           .progress({ count: 10, interval: 250 }, (received: any) => {
             if (isCancelled) return;
             const bytesNum = typeof received === 'string' ? parseInt(received, 10) || 0 : Math.max(0, received || 0);
-            partBytes[i] = existingPartBytes + bytesNum;
+            partBytes[i] = Math.min(partLength, existingPartBytes + bytesNum);
             handleProgressTick();
           });
 
@@ -455,12 +493,38 @@ class DownloadEngine {
 
       const results = await Promise.all(promises);
 
-      // Verify each part completed with valid HTTP status
+      // Verify each part completed with valid HTTP status (MUST be 206 for ranges)
       for (const res of results) {
         const info = res.info();
         if (info.status >= 400) {
           throw new Error(`Part download failed with HTTP ${info.status}`);
         }
+        if (info.status === 200 && numThreads > 1) {
+          throw new Error('Server returned HTTP 200 full file instead of HTTP 206 range for chunk');
+        }
+      }
+
+      // Pre-merge verification: verify EVERY SINGLE part file exists and has EXACTLY partLength bytes!
+      let totalVerifiedBytes = 0;
+      for (let i = 0; i < numThreads; i++) {
+        const start = i * chunkSize;
+        const end = (i === numThreads - 1) ? totalSize - 1 : (i + 1) * chunkSize - 1;
+        const expectedLength = end - start + 1;
+        const p = partPaths[i];
+
+        if (!(await ReactNativeBlobUtil.fs.exists(p))) {
+          throw new Error(`Part ${i} missing from disk!`);
+        }
+        const s = await ReactNativeBlobUtil.fs.stat(p);
+        const actualSize = Number(s.size);
+        if (actualSize !== expectedLength) {
+          throw new Error(`Part ${i} size mismatch: got ${actualSize} bytes, expected ${expectedLength} bytes`);
+        }
+        totalVerifiedBytes += actualSize;
+      }
+
+      if (totalVerifiedBytes !== totalSize) {
+        throw new Error(`Total verified chunks size (${totalVerifiedBytes}) != expected total (${totalSize})`);
       }
 
       // Clean existing target file if any
@@ -470,19 +534,25 @@ class DownloadEngine {
         }
       } catch (e) {}
 
-      // Concatenate parts natively using 'uri' encoding (zero JS memory overhead!)
+      // Concatenate parts natively using 'uri' encoding
       await ReactNativeBlobUtil.fs.cp(partPaths[0], filePath);
-      try { await ReactNativeBlobUtil.fs.unlink(partPaths[0]); } catch (e) {}
 
       for (let i = 1; i < numThreads; i++) {
-        if (await ReactNativeBlobUtil.fs.exists(partPaths[i])) {
-          await ReactNativeBlobUtil.fs.appendFile(filePath, partPaths[i], 'uri');
-          try { await ReactNativeBlobUtil.fs.unlink(partPaths[i]); } catch (e) {}
-        }
+        await ReactNativeBlobUtil.fs.appendFile(filePath, partPaths[i], 'uri');
       }
 
       const stat = await ReactNativeBlobUtil.fs.stat(filePath);
       const finalBytes = Number(stat.size);
+
+      if (finalBytes !== totalSize) {
+        throw new Error(`Merged file size mismatch: got ${finalBytes} bytes, expected ${totalSize} bytes`);
+      }
+
+      // ONLY delete part files after final merged file is verified bit-perfect!
+      for (let i = 0; i < numThreads; i++) {
+        try { await ReactNativeBlobUtil.fs.unlink(partPaths[i]); } catch (e) {}
+      }
+      try { await ReactNativeBlobUtil.fs.unlink(metaPath); } catch (e) {}
 
       this.updateDownloadState(id, {
         status: 'completed',
@@ -502,6 +572,9 @@ class DownloadEngine {
       this._processQueue();
 
     } catch (err: any) {
+      // Instantly cancel all sibling tasks to prevent rogue background threads
+      cancelAll(true);
+
       if (isCancelled || err.message?.includes('cancel') || err.message?.includes('abort') || err.message?.includes('canceled')) {
         // User PAUSED the download: KEEP all chunk files safe on disk so resume continues seamlessly!
         this._updateActiveLock();
@@ -663,6 +736,14 @@ class DownloadEngine {
         throw new Error(msg);
       }
 
+      // If we requested a resume (Range: bytes=X-), but server returned HTTP 200 OK:
+      // The server sent the entire file from byte 0, but overwrite was false so it appended to tempPartPath!
+      if (isResuming && httpStatus === 200) {
+        console.warn('Server ignored resume Range header and sent HTTP 200. Re-downloading from start.');
+        try { await ReactNativeBlobUtil.fs.unlink(tempPartPath); } catch {}
+        throw new Error('Server does not support resuming this file. Re-downloading from start.');
+      }
+
       // Rename final part to complete target path
       try {
         if (await ReactNativeBlobUtil.fs.exists(filePath)) {
@@ -799,6 +880,9 @@ class DownloadEngine {
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
     }
+
+    // Wait 60ms for native NSOutputStream to flush to disk cleanly
+    await new Promise(r => setTimeout(() => r(null), 60));
 
     // Measure exact bytes on disk from all parts
     const download = this.downloads.find(d => d.id === id);
