@@ -23,6 +23,7 @@ import { isValidUrl, isDownloadableUrl, normalizeUrl } from '../utils/fileUtils'
 import { AD_HIDE_CSS, AD_BLOCK_JS, shouldBlockUrl } from '../utils/adBlocker';
 import { AddDownloadModal } from '../components/AddDownloadModal';
 import { ErrorBoundary } from '../components/ErrorBoundary';
+import { BrowserErrorView } from '../components/BrowserErrorView';
 
 const SEARCH_ENGINES = {
   google: 'https://www.google.com/search?q=',
@@ -37,12 +38,15 @@ export function BrowserScreen() {
   const webViewRef = useRef<any>(null);
   const urlInputRef = useRef<any>(null);
 
+  // sourceUri is explicitly requested by user (prevents React from aborting in-flight 302 redirects)
+  const [sourceUri, setSourceUri] = useState(DEFAULT_HOME);
   const [currentUrl, setCurrentUrl] = useState(DEFAULT_HOME);
   const [urlBarText, setUrlBarText] = useState('');
   const [pageTitle, setPageTitle] = useState('');
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingDestination, setLoadingDestination] = useState<string | null>(null);
   const [isUrlFocused, setIsUrlFocused] = useState(false);
   const [progress, setProgress] = useState(0);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
@@ -52,6 +56,9 @@ export function BrowserScreen() {
   const [blockedCount, setBlockedCount] = useState(0);
   const [detectedMedia, setDetectedMedia] = useState<{ url: string; title: string }[]>([]);
   const [downloadToast, setDownloadToast] = useState<string | null>(null);
+
+  const terminateCountRef = useRef(0);
+  const lastTerminateTimeRef = useRef(0);
 
   const progressAnim = useRef(new Animated.Value(0)).current;
   const toastAnim = useRef(new Animated.Value(0)).current;
@@ -101,9 +108,11 @@ export function BrowserScreen() {
       url = getSearchUrl(trimmed);
     }
 
+    setSourceUri(url);
     setCurrentUrl(url);
     setUrlBarText(url);
     setIsUrlFocused(false);
+    setLoadingDestination(null);
   };
 
   const handleNavigationChange = (navState: any) => {
@@ -117,6 +126,14 @@ export function BrowserScreen() {
       if (!isUrlFocused) {
         setUrlBarText(navState.url);
       }
+      try {
+        const destHost = new URL(navState.url).hostname.replace(/^www\./, '');
+        if (navState.loading) {
+          setLoadingDestination(destHost);
+        } else {
+          setLoadingDestination(null);
+        }
+      } catch {}
     }
     if (navState.title) {
       setPageTitle(navState.title);
@@ -270,20 +287,10 @@ export function BrowserScreen() {
               return false;
             }
 
-            // Direct user clicks: ALWAYS allow
-            if (navigationType === 'click') {
+            // Direct user clicks & top-frame redirects: ALWAYS allow
+            // Top-frame redirects are legitimate site forwards (or error pages)
+            if (isTopFrame) {
               return true;
-            }
-
-            // Script-triggered background popunders: BLOCK
-            if (navigationType === 'other' && !isTrustedMediaHost && !isDownloadableUrl(safeUrl)) {
-              const isSearchOrHome = url === DEFAULT_HOME || targetHost.includes('google.com') || targetHost.includes('duckduckgo.com');
-              if (!isSearchOrHome) {
-                setTimeout(() => {
-                  setBlockedCount(prev => prev + 1);
-                }, 10);
-                return false;
-              }
             }
           }
         } catch (e) {}
@@ -427,6 +434,16 @@ export function BrowserScreen() {
         </View>
       )}
 
+      {/* Live Navigation & Destination Status */}
+      {isLoading && (
+        <View style={styles.destinationBar}>
+          <ActivityIndicator size="small" color={Colors.accent} style={styles.destinationSpinner} />
+          <Text style={styles.destinationText} numberOfLines={1}>
+            {loadingDestination ? `Connecting: ${loadingDestination}...` : 'Connecting to page...'}
+          </Text>
+        </View>
+      )}
+
       {/* Ad block badge */}
       {settings.adBlockEnabled && blockedCount > 0 && (
         <View style={styles.adBlockBadge}>
@@ -453,7 +470,7 @@ export function BrowserScreen() {
                 key={bm.id}
                 style={styles.bookmarkItem}
                 onPress={() => {
-                  setCurrentUrl(bm.url);
+                  navigateToUrl(bm.url);
                   setShowBookmarks(false);
                 }}
                 onLongPress={() => {
@@ -478,32 +495,74 @@ export function BrowserScreen() {
       {/* WebView */}
       <WebView
         ref={webViewRef}
-        source={{ uri: currentUrl }}
+        source={{ uri: sourceUri }}
         style={styles.webview}
         originWhitelist={['*']}
         onNavigationStateChange={handleNavigationChange}
         onShouldStartLoadWithRequest={handleShouldStartLoad}
         onMessage={handleWebViewMessage}
-        onLoadStart={() => setIsLoading(true)}
-        onLoadEnd={() => setIsLoading(false)}
+        onLoadStart={({ nativeEvent }) => {
+          setIsLoading(true);
+          try {
+            const host = new URL(nativeEvent.url || currentUrl).hostname.replace(/^www\./, '');
+            setLoadingDestination(host);
+          } catch {}
+        }}
+        onLoadEnd={() => {
+          setIsLoading(false);
+          setLoadingDestination(null);
+        }}
         onLoadProgress={({ nativeEvent }) => setProgress(nativeEvent.progress)}
         onError={(syntheticEvent) => {
           const { nativeEvent } = syntheticEvent;
+          // Ignore -999 (cancelled during normal redirect)
+          if (nativeEvent?.code === -999) return;
           console.warn('[WebView Error]', nativeEvent?.description || nativeEvent);
+          setLoadingDestination(null);
         }}
         onHttpError={(syntheticEvent) => {
           const { nativeEvent } = syntheticEvent;
           console.warn('[WebView HttpError]', nativeEvent?.statusCode);
+          setLoadingDestination(null);
         }}
         onContentProcessDidTerminate={() => {
-          console.warn('WebView content process terminated, recovering...');
-          webViewRef.current?.reload();
+          const now = Date.now();
+          if (now - lastTerminateTimeRef.current < 4000) {
+            terminateCountRef.current += 1;
+          } else {
+            terminateCountRef.current = 1;
+          }
+          lastTerminateTimeRef.current = now;
+
+          if (terminateCountRef.current <= 2) {
+            console.warn('WebView content process terminated, recovering...');
+            webViewRef.current?.reload();
+          } else {
+            console.warn('WebView content process terminated repeatedly.');
+          }
         }}
-        onRenderProcessGone={(e: any): boolean => {
-          console.warn('WebView render process gone, recovering...');
-          webViewRef.current?.reload();
-          return true;
-        }}
+        renderError={(errorDomain, errorCode, errorDesc) => (
+          <BrowserErrorView
+            errorDomain={errorDomain}
+            errorCode={errorCode}
+            errorDescription={errorDesc}
+            failingUrl={currentUrl || sourceUri}
+            onRetry={() => webViewRef.current?.reload()}
+            onGoBack={() => {
+              if (canGoBack) {
+                webViewRef.current?.goBack();
+              } else {
+                setSourceUri(DEFAULT_HOME);
+                setCurrentUrl(DEFAULT_HOME);
+              }
+            }}
+            onGoHome={() => {
+              setSourceUri(DEFAULT_HOME);
+              setCurrentUrl(DEFAULT_HOME);
+            }}
+            onDirectDownload={(dlUrl) => handleDownload(dlUrl)}
+          />
+        )}
         setSupportMultipleWindows={false}
         javaScriptCanOpenWindowsAutomatically={false}
         injectedJavaScriptBeforeContentLoaded={
@@ -591,7 +650,12 @@ export function BrowserScreen() {
       <View style={styles.bottomToolbar}>
         <TouchableOpacity
           style={styles.bottomBtn}
-          onPress={() => setCurrentUrl(DEFAULT_HOME)}
+          onPress={() => {
+            setSourceUri(DEFAULT_HOME);
+            setCurrentUrl(DEFAULT_HOME);
+            setUrlBarText(DEFAULT_HOME);
+            setLoadingDestination(null);
+          }}
         >
           <Text style={styles.bottomBtnIcon}>🏠</Text>
           <Text style={styles.bottomBtnText}>Home</Text>
@@ -739,6 +803,25 @@ const styles = StyleSheet.create({
   progressFill: {
     height: '100%',
     backgroundColor: Colors.primary,
+  },
+  destinationBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 242, 254, 0.08)',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(0, 242, 254, 0.2)',
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    gap: 6,
+  },
+  destinationSpinner: {
+    transform: [{ scale: 0.7 }],
+  },
+  destinationText: {
+    fontSize: 11,
+    color: Colors.accent,
+    fontWeight: '600',
+    flex: 1,
   },
   adBlockBadge: {
     position: 'absolute',
