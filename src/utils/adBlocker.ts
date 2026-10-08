@@ -79,6 +79,23 @@ export const AD_BLOCK_RULES = [
   '*.shrinkme.io',
   '*.za.gl',
 
+  // Betting, Scam & Adult Popups commonly triggered on movie links
+  '*.1xbet.com',
+  '*.1xbet.wh',
+  '*.bet365.com',
+  '*.mostbet.com',
+  '*.parimatch.com',
+  '*.melbet.com',
+  '*.1win.pro',
+  '*.stake.com',
+  '*.richads.com',
+  '*.adcash.com',
+  '*.galaksion.com',
+  '*.clickstar.me',
+  '*.rollerads.com',
+  '*.clickaine.com',
+  '*.syndication.exoclick.com',
+
   // General Ad Exchanges & SSPs
   '*.adnxs.com',
   '*.adsrvr.org',
@@ -133,13 +150,18 @@ export const AD_BLOCK_RULES = [
   '*.whos.amung.us',
 ];
 
+// Pre-process rule domains for high-speed matching without runtime allocations
+export const AD_BLOCK_DOMAINS: string[] = AD_BLOCK_RULES.map(rule =>
+  rule.replace(/^\*\.?/, '').toLowerCase()
+);
+
 // CSS injection to hide ads, banners, AdChoices, and popunders cleanly
 export const AD_HIDE_CSS = `
   /* AdChoices, Google Ads, Sponsored Banners */
-  [class*="adchoices"], [id*="adchoices"],
-  [class*="ad-choices"], [id*="ad-choices"],
-  a[href*="adchoices"], a[href*="youradchoices"], a[href*="aboutads.info"], a[href*="youronlinechoices"],
-  img[src*="adchoices"], svg[class*="adchoices"], [aria-label*="AdChoices"], [title*="AdChoices"],
+  [class*="adchoices" i], [id*="adchoices" i],
+  [class*="ad-choices" i], [id*="ad-choices" i],
+  a[href*="adchoices" i], a[href*="youradchoices" i], a[href*="aboutads.info" i], a[href*="youronlinechoices" i],
+  img[src*="adchoices" i], svg[class*="adchoices" i], [aria-label*="AdChoices" i], [title*="AdChoices" i],
   [data-adchoices], [data-ad-feedback], [data-google-av-cxn], [data-google-av-adk],
   [id*="google_ads"], [class*="google_ads"],
   div[id*="google_ads_iframe"], iframe[id*="google_ads_iframe"],
@@ -147,6 +169,8 @@ export const AD_HIDE_CSS = `
   .adsbygoogle, ins.adsbygoogle,
   div[data-google-query-id],
   div[data-ad-client], div[data-ad-slot], div[data-ad-format],
+  div[data-adunit], div[data-ad-unit], div[data-dfp],
+  div[id*="div-gpt-ad"], div[class*="div-gpt-ad"],
   div[class*="ad_unit"], div[id*="ad_unit"],
   div[class*="ad_wrapper"], div[id*="ad_wrapper"],
   div[class*="ad_container"], div[id*="ad_container"],
@@ -160,6 +184,7 @@ export const AD_HIDE_CSS = `
   [class*="sponsored"], [id*="sponsored"],
   iframe[src*="doubleclick"], iframe[src*="pop"],
   iframe[src*="/ads/"], iframe[src*="adservice"], iframe[src*="adserver"], iframe[src*="ads."],
+  iframe[src*="googlesyndication"], iframe[src*="adchoices"],
   div[data-ad], div[data-ads], div[data-advert],
   .ad-container, .ad-wrapper, .ad-slot, .ad-unit,
   .ad-banner, .ad-box, .ad-frame, .ad-overlay,
@@ -167,6 +192,13 @@ export const AD_HIDE_CSS = `
   .google-ad, .adsense,
   .ad-placeholder,
   div[class*="popunder"], div[id*="popunder"],
+  div[class*="sticky-ad"], div[id*="sticky-ad"],
+  div[class*="floating-video"], div[id*="floating-video"],
+  div[class*="vdo"], div[class*="aniview"],
+  a[target="_blank"][style*="z-index: 2147483647"],
+  div[style*="z-index: 2147483647"],
+  a[target="_blank"][style*="z-index:2147483647"],
+  div[style*="z-index:2147483647"],
   div[class*="overlay"][style*="z-index: 999"],
   div[class*="overlay"][style*="z-index:999"],
   div[class*="overlay"][style*="z-index: 1000"],
@@ -177,6 +209,7 @@ export const AD_HIDE_CSS = `
     max-height: 0 !important;
     overflow: hidden !important;
     pointer-events: none !important;
+    opacity: 0 !important;
   }
 
   /* Never hide Cloudflare, Turnstile, Captcha challenge frames & backdrops */
@@ -243,6 +276,115 @@ export const AD_BLOCK_JS = `
     if (isChallengeActive()) {
       return;
     }
+
+    // Neutralize popups and window.open on spam movie ad links
+    try {
+      var _origOpen = window.open;
+      window.open = function(u, t, f) {
+        if (isChallengeActive()) return _origOpen ? _origOpen.apply(window, arguments) : null;
+        if (!u) return null;
+        var su = String(u).toLowerCase();
+        if (/\\.(mp4|mkv|avi|mov|zip|rar|7z)(\\?|#|$)/i.test(su)) {
+          if (window.ReactNativeWebView) {
+            window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'MEDIA_DETECTED', url: u, title: document.title || 'Video' }));
+          }
+          return null;
+        }
+        return null;
+      };
+    } catch(e) {}
+
+    // Suppress scam alert/confirm popups
+    try {
+      window.alert = function() {};
+      window.confirm = function() { return false; };
+      window.prompt = function() { return null; };
+    } catch(e) {}
+
+    // Purge transparent clickjack overlays from DOM without layout thrashing
+    function purgeOverlays() {
+      if (isChallengeActive()) return;
+      try {
+        var candidates = document.querySelectorAll(
+          'div[style*="z-index"], a[style*="z-index"], ' +
+          'div[style*="fixed"], div[style*="absolute"], ' +
+          '[class*="overlay"], [class*="popunder"], [id*="overlay"], [id*="popunder"]'
+        );
+        for (var i = 0; i < candidates.length; i++) {
+          var el = candidates[i];
+          if (el.id && el.id.indexOf('challenge') !== -1) continue;
+          var zIndex = el.style.zIndex || (window.getComputedStyle ? window.getComputedStyle(el).zIndex : '');
+          var z = parseInt(zIndex, 10);
+          if (z >= 999) {
+            var w = el.offsetWidth || el.clientWidth || 0;
+            var h = el.offsetHeight || el.clientHeight || 0;
+            if (w > window.innerWidth * 0.7 && h > window.innerHeight * 0.7) {
+              el.remove();
+            }
+          }
+        }
+      } catch(e) {}
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', purgeOverlays);
+    } else {
+      purgeOverlays();
+    }
+
+    // Capture and neutralize malicious clickjack links and popunders in the capture phase
+    try {
+      document.addEventListener('click', function(e) {
+        if (isChallengeActive()) return;
+        try {
+          var el = e.target;
+          while (el && el.tagName !== 'A' && el.tagName !== 'BODY') {
+            el = el.parentElement;
+          }
+          if (el && el.tagName === 'A') {
+            var href = el.getAttribute('href') || el.href || '';
+            var target = el.getAttribute('target') || '';
+            var lowerHref = href.toLowerCase();
+
+            // Block ad and betting links directly before they trigger navigation
+            if (
+              lowerHref.indexOf('adsterra') !== -1 ||
+              lowerHref.indexOf('highcpm') !== -1 ||
+              lowerHref.indexOf('monetag') !== -1 ||
+              lowerHref.indexOf('onclick') !== -1 ||
+              lowerHref.indexOf('propeller') !== -1 ||
+              lowerHref.indexOf('popads') !== -1 ||
+              lowerHref.indexOf('popcash') !== -1 ||
+              lowerHref.indexOf('1xbet') !== -1 ||
+              lowerHref.indexOf('bet365') !== -1 ||
+              lowerHref.indexOf('1win') !== -1 ||
+              lowerHref.indexOf('mostbet') !== -1 ||
+              lowerHref.indexOf('parimatch') !== -1 ||
+              lowerHref.indexOf('melbet') !== -1 ||
+              lowerHref.indexOf('doubleclick') !== -1 ||
+              lowerHref.indexOf('googlesyndication') !== -1
+            ) {
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation();
+              return false;
+            }
+
+            // Remove full-screen clickjack overlay anchors
+            if (target === '_blank') {
+              var s = el.getAttribute('style') || '';
+              if (s.indexOf('2147483647') !== -1 || (s.indexOf('fixed') !== -1 && s.indexOf('z-index') !== -1)) {
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                try { el.remove(); } catch(err) {}
+                return false;
+              }
+            }
+          }
+        } catch(err) {}
+      }, true);
+    } catch(e) {}
 
     // Media Sniffer (IDM style) - Detects video sources for easy 1-tap download
     function sniffMedia() {
@@ -336,7 +478,7 @@ export const AD_BLOCK_JS = `
   true;
 `;
 
-// Check if a URL should be blocked
+// Check if a URL should be blocked (Ultra-fast and zero-allocation)
 export function shouldBlockUrl(url: string): boolean {
   if (!url) return false;
   const lowerUrl = url.toLowerCase();
@@ -364,9 +506,54 @@ export function shouldBlockUrl(url: string): boolean {
     return false;
   }
 
-  return AD_BLOCK_RULES.some(rule => {
-    const domain = rule.replace('*.', '').replace('*', '');
-    return lowerUrl.includes(domain);
-  });
+  // 1. Fast match against known ad domains
+  for (let i = 0; i < AD_BLOCK_DOMAINS.length; i++) {
+    if (lowerUrl.includes(AD_BLOCK_DOMAINS[i])) {
+      return true;
+    }
+  }
+
+  // 2. Match aggressive ad/popunder keywords in hostname
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+
+    const adKeywords = [
+      'doubleclick', 'googlesyndication', 'googleadservices', 'adchoices',
+      'popads', 'popcash', 'propeller', 'onclick', 'clickadu',
+      'adsterra', 'exoclick', 'trafficjunky', 'juicyads', 'hilltopads',
+      'highcpm', 'alwingulla', 'deloton', 'onmarshtomato', 'monetag',
+      'adkeeper', 'adskeeper', 'admaven', 'vdo.ai', 'aniview',
+      'zeroredirect', 'adtrue', 'bidvertiser', 'mgid',
+      '1xbet', 'bet365', 'mostbet', 'parimatch', 'melbet', '1win',
+      'stake.com', 'richads', 'adcash', 'galaksion', 'clickstar',
+      'rollerads', 'clickaine', 'syndication.exoclick', 'exosrv',
+      'criteo', 'pubmatic', 'rubiconproject', 'casalemedia',
+      'taboola', 'outbrain', 'adnxs', 'smartadserver'
+    ];
+
+    for (let i = 0; i < adKeywords.length; i++) {
+      if (host.includes(adKeywords[i])) {
+        return true;
+      }
+    }
+
+    const path = parsed.pathname.toLowerCase();
+    if (
+      path.includes('/ads/') ||
+      path.includes('/popunder') ||
+      path.includes('/banner/') ||
+      path.includes('/adserver') ||
+      path.includes('/adservice') ||
+      path.endsWith('/popup.js') ||
+      path.endsWith('/ads.js') ||
+      path.endsWith('/show_ads.js') ||
+      path.endsWith('/ad.js')
+    ) {
+      return true;
+    }
+  } catch {}
+
+  return false;
 }
 

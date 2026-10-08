@@ -46,7 +46,6 @@ export function BrowserScreen() {
   const [canGoBack, setCanGoBack] = useState(false);
   const [canGoForward, setCanGoForward] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [loadingDestination, setLoadingDestination] = useState<string | null>(null);
   const [isUrlFocused, setIsUrlFocused] = useState(false);
   const [progress, setProgress] = useState(0);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
@@ -112,7 +111,6 @@ export function BrowserScreen() {
     setCurrentUrl(url);
     setUrlBarText(url);
     setIsUrlFocused(false);
-    setLoadingDestination(null);
   };
 
   const handleNavigationChange = (navState: any) => {
@@ -126,14 +124,6 @@ export function BrowserScreen() {
       if (!isUrlFocused) {
         setUrlBarText(navState.url);
       }
-      try {
-        const destHost = new URL(navState.url).hostname.replace(/^www\./, '');
-        if (navState.loading) {
-          setLoadingDestination(destHost);
-        } else {
-          setLoadingDestination(null);
-        }
-      } catch {}
     }
     if (navState.title) {
       setPageTitle(navState.title);
@@ -263,34 +253,89 @@ export function BrowserScreen() {
           const currentHost = new URL(normalizeUrl(currentUrl)).hostname.replace(/^www\./, '');
           const targetHost = new URL(safeUrl).hostname.replace(/^www\./, '');
 
+          // If navigating to a different domain
           if (targetHost && targetHost !== currentHost) {
             const isTrustedMediaHost = 
               targetHost.includes('drive.google.com') ||
               targetHost.includes('mediafire.com') ||
               targetHost.includes('mega.nz') ||
+              targetHost.includes('mega.co.nz') ||
               targetHost.includes('pixeldrain.com') ||
               targetHost.includes('gofile.io') ||
               targetHost.includes('hubcloud') ||
+              targetHost.includes('hubdrive') ||
               targetHost.includes('gdflix') ||
+              targetHost.includes('gdriveplayer') ||
               targetHost.includes('fastdl') ||
               targetHost.includes('1cloud') ||
               targetHost.includes('streamtape') ||
+              targetHost.includes('streamhide') ||
+              targetHost.includes('streamsilk') ||
+              targetHost.includes('streamwish') ||
+              targetHost.includes('streamhub') ||
               targetHost.includes('doodstream') ||
+              targetHost.includes('dood.') ||
+              targetHost.includes('doodvideo') ||
+              targetHost.includes('ds2play') ||
               targetHost.includes('dropbox.com') ||
+              targetHost.includes('terabox.com') ||
+              targetHost.includes('1024tera') ||
+              targetHost.includes('nephobox') ||
+              targetHost.includes('katfile.com') ||
+              targetHost.includes('rapidgator.net') ||
+              targetHost.includes('krakenfiles.com') ||
+              targetHost.includes('hexupload') ||
+              targetHost.includes('vidsrc.') ||
+              targetHost.includes('vidcloud.') ||
+              targetHost.includes('vidplay') ||
+              targetHost.includes('vidmoly') ||
+              targetHost.includes('mixdrop.') ||
+              targetHost.includes('filemoon.') ||
+              targetHost.includes('upstream.') ||
+              targetHost.includes('mp4upload') ||
               targetHost.includes('github.com');
 
-            // If an iframe tries to navigate to an unknown third-party domain: BLOCK
-            if (!isTopFrame && !isTrustedMediaHost) {
-              setTimeout(() => {
-                setBlockedCount(prev => prev + 1);
-              }, 10);
-              return false;
-            }
+            const isSearchOrHome = 
+              targetHost.includes('google.') || 
+              targetHost.includes('duckduckgo.') || 
+              targetHost.includes('bing.');
 
-            // Direct user clicks & top-frame redirects: ALWAYS allow
-            // Top-frame redirects are legitimate site forwards (or error pages)
-            if (isTopFrame) {
-              return true;
+            // Subdomains of current host are allowed (e.g. m.yomovies.ac or api.yomovies.ac)
+            const isSubdomain = targetHost.endsWith('.' + currentHost) || currentHost.endsWith('.' + targetHost);
+
+            if (!isSubdomain) {
+              // A. Sub-iframe navigation to unknown third-party domain: BLOCK
+              if (!isTopFrame && !isTrustedMediaHost) {
+                setTimeout(() => {
+                  setBlockedCount(prev => prev + 1);
+                }, 10);
+                return false;
+              }
+
+              // B. Script-triggered background popunders (window.location / meta refresh / clickjack): BLOCK
+              if (navigationType === 'other' && !isTrustedMediaHost && !isDownloadableUrl(safeUrl) && !isSearchOrHome) {
+                setTimeout(() => {
+                  setBlockedCount(prev => prev + 1);
+                }, 10);
+                return false;
+              }
+
+              // C. If user clicked, but the destination is an ad / betting / tracking site: BLOCK
+              if (shouldBlockUrl(url) || shouldBlockUrl(safeUrl)) {
+                setTimeout(() => {
+                  setBlockedCount(prev => prev + 1);
+                }, 10);
+                return false;
+              }
+
+              // D. If user clicked on a movie site and it tries to open a suspicious TLD ad popunder: BLOCK
+              const suspiciousAdTld = /\.(xyz|top|bid|click|live|today|club|online|work|cfd|sbs|bond)(\/|$)/i.test(targetHost);
+              if (suspiciousAdTld && !isTrustedMediaHost) {
+                setTimeout(() => {
+                  setBlockedCount(prev => prev + 1);
+                }, 10);
+                return false;
+              }
             }
           }
         } catch (e) {}
@@ -434,15 +479,7 @@ export function BrowserScreen() {
         </View>
       )}
 
-      {/* Live Navigation & Destination Status */}
-      {isLoading && (
-        <View style={styles.destinationBar}>
-          <ActivityIndicator size="small" color={Colors.accent} style={styles.destinationSpinner} />
-          <Text style={styles.destinationText} numberOfLines={1}>
-            {loadingDestination ? `Connecting: ${loadingDestination}...` : 'Connecting to page...'}
-          </Text>
-        </View>
-      )}
+
 
       {/* Ad block badge */}
       {settings.adBlockEnabled && blockedCount > 0 && (
@@ -501,29 +538,18 @@ export function BrowserScreen() {
         onNavigationStateChange={handleNavigationChange}
         onShouldStartLoadWithRequest={handleShouldStartLoad}
         onMessage={handleWebViewMessage}
-        onLoadStart={({ nativeEvent }) => {
-          setIsLoading(true);
-          try {
-            const host = new URL(nativeEvent.url || currentUrl).hostname.replace(/^www\./, '');
-            setLoadingDestination(host);
-          } catch {}
-        }}
-        onLoadEnd={() => {
-          setIsLoading(false);
-          setLoadingDestination(null);
-        }}
+        onLoadStart={() => setIsLoading(true)}
+        onLoadEnd={() => setIsLoading(false)}
         onLoadProgress={({ nativeEvent }) => setProgress(nativeEvent.progress)}
         onError={(syntheticEvent) => {
           const { nativeEvent } = syntheticEvent;
           // Ignore -999 (cancelled during normal redirect)
           if (nativeEvent?.code === -999) return;
           console.warn('[WebView Error]', nativeEvent?.description || nativeEvent);
-          setLoadingDestination(null);
         }}
         onHttpError={(syntheticEvent) => {
           const { nativeEvent } = syntheticEvent;
           console.warn('[WebView HttpError]', nativeEvent?.statusCode);
-          setLoadingDestination(null);
         }}
         onContentProcessDidTerminate={() => {
           const now = Date.now();
@@ -582,13 +608,20 @@ export function BrowserScreen() {
                   }
                   ${injectedJS}
                   var style = document.createElement('style');
+                  style.id = 'td-ad-blocker-css';
                   style.textContent = \`${injectedCSS.replace(/`/g, '\\`')}\`;
-                  if (document.head) {
-                    document.head.appendChild(style);
+                  var target = document.head || document.documentElement || document.body;
+                  if (target) {
+                    target.appendChild(style);
                   } else {
-                    document.addEventListener('DOMContentLoaded', function() {
-                      if (document.head) document.head.appendChild(style);
+                    var obs = new MutationObserver(function() {
+                      var t = document.head || document.documentElement || document.body;
+                      if (t) {
+                        t.appendChild(style);
+                        obs.disconnect();
+                      }
                     });
+                    obs.observe(document, { childList: true, subtree: true });
                   }
                 } catch(e) {}
               })();
@@ -596,9 +629,7 @@ export function BrowserScreen() {
             `
             : undefined
         }
-        injectedJavaScript={settings.adBlockEnabled ? injectedJS : undefined}
-        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={true}
-        injectedJavaScriptForMainFrameOnly={true}
+        injectedJavaScriptBeforeContentLoadedForMainFrameOnly={false}
         allowsBackForwardNavigationGestures
         allowsInlineMediaPlayback
         mediaPlaybackRequiresUserAction={false}
@@ -654,7 +685,6 @@ export function BrowserScreen() {
             setSourceUri(DEFAULT_HOME);
             setCurrentUrl(DEFAULT_HOME);
             setUrlBarText(DEFAULT_HOME);
-            setLoadingDestination(null);
           }}
         >
           <Text style={styles.bottomBtnIcon}>🏠</Text>
@@ -804,25 +834,7 @@ const styles = StyleSheet.create({
     height: '100%',
     backgroundColor: Colors.primary,
   },
-  destinationBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 242, 254, 0.08)',
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(0, 242, 254, 0.2)',
-    paddingHorizontal: 12,
-    paddingVertical: 5,
-    gap: 6,
-  },
-  destinationSpinner: {
-    transform: [{ scale: 0.7 }],
-  },
-  destinationText: {
-    fontSize: 11,
-    color: Colors.accent,
-    fontWeight: '600',
-    flex: 1,
-  },
+
   adBlockBadge: {
     position: 'absolute',
     top: 100,
