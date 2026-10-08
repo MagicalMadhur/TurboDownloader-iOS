@@ -405,7 +405,7 @@ class DownloadEngine {
           fileCache: true,
           path: partPath,
           followRedirect: true,
-          IOSBackgroundTask: true,
+          IOSBackgroundTask: false, // Must be false to use NSURLSessionDataTask which streams bytes incrementally to disk via NSOutputStream!
           overwrite: !isResumingPart, // overwrite: false enables native iOS [NSOutputStream initToFileAtPath:partPath append:YES]!
         };
 
@@ -528,7 +528,7 @@ class DownloadEngine {
         fileCache: true,
         path: tempPartPath,
         followRedirect: true,
-        IOSBackgroundTask: true,
+        IOSBackgroundTask: false,
         indicator: true,
         overwrite: !isResuming, // append directly to tempPartPath when resuming!
       };
