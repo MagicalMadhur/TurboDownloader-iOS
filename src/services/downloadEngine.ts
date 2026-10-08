@@ -53,6 +53,28 @@ class DownloadEngine {
   private listeners: Set<DownloadListCallback> = new Set();
   private downloads: DownloadItem[] = [];
   private speedTrackers: Map<string, SpeedTracker> = new Map();
+  private retryAttempts: Map<string, number> = new Map();
+  private retryTimers: Map<string, any> = new Map();
+
+  private async _updateActiveLock(): Promise<void> {
+    try {
+      const downloadDir = this.getDownloadDir();
+      const lockPath = `${downloadDir}/TurboDownloader/.active_download_lock`;
+      const hasActive = this.activeDownloads.size > 0 || this.downloads.some(d => d.status === 'downloading');
+
+      if (hasActive) {
+        const exists = await ReactNativeBlobUtil.fs.exists(lockPath);
+        if (!exists) {
+          await ReactNativeBlobUtil.fs.writeFile(lockPath, 'active', 'utf8');
+        }
+      } else {
+        const exists = await ReactNativeBlobUtil.fs.exists(lockPath);
+        if (exists) {
+          await ReactNativeBlobUtil.fs.unlink(lockPath);
+        }
+      }
+    } catch {}
+  }
 
   async initialize(): Promise<void> {
     this.downloads = await storage.getDownloads();
@@ -172,6 +194,7 @@ class DownloadEngine {
     const { id } = download;
     const url = normalizeUrl(download.url);
     this.updateDownloadState(id, { status: 'downloading', url });
+    this._updateActiveLock();
     this.speedTrackers.set(id, { lastBytes: download.downloadedSize || 0, lastTime: Date.now(), smoothedSpeed: 0, lastNotifyTime: 0 });
 
     const settings = await storage.getSettings();
@@ -473,26 +496,56 @@ class DownloadEngine {
 
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
+      this.retryAttempts.delete(id);
+      this._updateActiveLock();
       await this._persistState();
       this._processQueue();
 
     } catch (err: any) {
       if (isCancelled || err.message?.includes('cancel') || err.message?.includes('abort') || err.message?.includes('canceled')) {
         // User PAUSED the download: KEEP all chunk files safe on disk so resume continues seamlessly!
+        this._updateActiveLock();
         return;
       }
 
       console.warn('Multi-part download interrupted:', err.message);
-      // DO NOT delete parts if network dropped! Keep parts so resume picks them up!
-      this.updateDownloadState(id, {
-        status: 'failed',
-        speed: 0,
-        error: err.message || 'Download interrupted. Tap retry to resume.',
-      });
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
-      await this._persistState();
-      this._processQueue();
+
+      const attempts = (this.retryAttempts.get(id) || 0) + 1;
+      const MAX_RETRIES = 5;
+
+      if (attempts <= MAX_RETRIES) {
+        this.retryAttempts.set(id, attempts);
+        const delayMs = Math.min(3000 * Math.pow(2, attempts - 1), 30000);
+        console.log(`[Auto-Retry] Multi-thread download for ${download.fileName} interrupted. Retrying in ${delayMs / 1000}s (Attempt ${attempts}/${MAX_RETRIES})...`);
+
+        this.updateDownloadState(id, {
+          status: 'downloading',
+          speed: 0,
+          error: `Reconnecting in ${delayMs / 1000}s (Attempt ${attempts}/${MAX_RETRIES})...`,
+        });
+        this._updateActiveLock();
+
+        const timer = setTimeout(() => {
+          this.retryTimers.delete(id);
+          const current = this.downloads.find(d => d.id === id);
+          if (current && (current.status === 'downloading' || current.status === 'queued')) {
+            this._executeDownload(current).catch(() => {});
+          }
+        }, delayMs);
+        this.retryTimers.set(id, timer);
+      } else {
+        this.retryAttempts.delete(id);
+        this.updateDownloadState(id, {
+          status: 'failed',
+          speed: 0,
+          error: err.message || 'Download interrupted. Tap retry to resume.',
+        });
+        this._updateActiveLock();
+        await this._persistState();
+        this._processQueue();
+      }
     }
   }
 
@@ -677,30 +730,65 @@ class DownloadEngine {
 
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
+      this.retryAttempts.delete(id);
+      this._updateActiveLock();
       await this._persistState();
       this._processQueue();
 
     } catch (error: any) {
       if (isCancelled || error.message?.includes('cancel') || error.message?.includes('abort') || error.message?.includes('canceled')) {
         // Paused by user! KEEP tempPartPath on disk so resume continues from existing bytes!
+        this._updateActiveLock();
         return;
       }
 
       console.error('Download failed:', error);
-      this.updateDownloadState(id, {
-        status: 'failed',
-        speed: 0,
-        error: error.message || 'Download failed',
-      });
-
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
-      await this._persistState();
-      this._processQueue();
+
+      const attempts = (this.retryAttempts.get(id) || 0) + 1;
+      const MAX_RETRIES = 5;
+
+      if (attempts <= MAX_RETRIES) {
+        this.retryAttempts.set(id, attempts);
+        const delayMs = Math.min(3000 * Math.pow(2, attempts - 1), 30000);
+        console.log(`[Auto-Retry] Single-thread download for ${download.fileName} interrupted. Retrying in ${delayMs / 1000}s (Attempt ${attempts}/${MAX_RETRIES})...`);
+
+        this.updateDownloadState(id, {
+          status: 'downloading',
+          speed: 0,
+          error: `Reconnecting in ${delayMs / 1000}s (Attempt ${attempts}/${MAX_RETRIES})...`,
+        });
+        this._updateActiveLock();
+
+        const timer = setTimeout(() => {
+          this.retryTimers.delete(id);
+          const current = this.downloads.find(d => d.id === id);
+          if (current && (current.status === 'downloading' || current.status === 'queued')) {
+            this._executeDownload(current).catch(() => {});
+          }
+        }, delayMs);
+        this.retryTimers.set(id, timer);
+      } else {
+        this.retryAttempts.delete(id);
+        this.updateDownloadState(id, {
+          status: 'failed',
+          speed: 0,
+          error: error.message || 'Download failed',
+        });
+        this._updateActiveLock();
+        await this._persistState();
+        this._processQueue();
+      }
     }
   }
 
   async pauseDownload(id: string): Promise<void> {
+    const timer = this.retryTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.retryTimers.delete(id);
+    this.retryAttempts.delete(id);
+
     const active = this.activeDownloads.get(id);
     if (active) {
       try {
@@ -762,6 +850,7 @@ class DownloadEngine {
     }
 
     await this._persistState();
+    this._updateActiveLock();
     this._processQueue();
   }
 
@@ -782,6 +871,11 @@ class DownloadEngine {
   }
 
   async cancelDownload(id: string): Promise<void> {
+    const timer = this.retryTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.retryTimers.delete(id);
+    this.retryAttempts.delete(id);
+
     const active = this.activeDownloads.get(id);
     if (active) {
       try {
@@ -826,6 +920,7 @@ class DownloadEngine {
     }
 
     await this._persistState();
+    this._updateActiveLock();
     this._processQueue();
   }
 
@@ -850,12 +945,14 @@ class DownloadEngine {
 
     this.downloads = this.downloads.filter(d => d.id !== id);
     await storage.saveDownloads(this.downloads);
+    this._updateActiveLock();
     this.notifyListeners();
   }
 
   async clearCompletedDownloads(): Promise<void> {
     this.downloads = this.downloads.filter(d => d.status !== 'completed');
     await storage.saveDownloads(this.downloads);
+    this._updateActiveLock();
     this.notifyListeners();
   }
 
@@ -865,12 +962,24 @@ class DownloadEngine {
       await this.pauseDownload(id);
     }
     this.downloadQueue = [];
+    this._updateActiveLock();
   }
 
   async resumeAll(): Promise<void> {
     const paused = this.downloads.filter(d => d.status === 'paused');
     for (const download of paused) {
       await this.resumeDownload(download.id);
+    }
+  }
+
+  async resumeInterruptedDownloads(): Promise<void> {
+    const interrupted = this.downloads.filter(
+      d => (d.status === 'downloading' && !this.activeDownloads.has(d.id)) ||
+           (d.status === 'failed' && d.error && !d.error.includes('403') && !d.error.includes('404'))
+    );
+    for (const d of interrupted) {
+      console.log(`[Auto-Resume] Resuming interrupted download on app wakeup: ${d.fileName}`);
+      await this.resumeDownload(d.id);
     }
   }
 

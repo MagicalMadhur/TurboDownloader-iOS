@@ -41,6 +41,7 @@
 	<array>
 		<string>fetch</string>
 		<string>processing</string>
+		<string>audio</string>
 	</array>
 	<!-- Enable iOS Live Activities & Dynamic Island -->
 	<key>NSSupportsLiveActivities</key>

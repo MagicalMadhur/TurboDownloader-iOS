@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
+import { AppState, AppStateStatus } from 'react-native';
 import { downloadEngine } from '../services/downloadEngine';
 import { storage, DownloadItem, AppSettings, DEFAULT_SETTINGS } from '../services/storage';
 
@@ -56,6 +57,16 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     return () => {
       if (speedIntervalRef.current) clearInterval(speedIntervalRef.current);
     };
+  }, []);
+
+  // Auto-resume interrupted downloads whenever app wakes up or becomes active
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState: AppStateStatus) => {
+      if (nextState === 'active') {
+        downloadEngine.resumeInterruptedDownloads();
+      }
+    });
+    return () => subscription.remove();
   }, []);
 
   const activeDownloads = downloads.filter(
