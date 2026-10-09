@@ -7,7 +7,7 @@ import MediaPlayer
 import UserNotifications
 
 @main
-class AppDelegate: UIResponder, UIApplicationDelegate {
+class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
   var window: UIWindow?
 
   var reactNativeDelegate: ReactNativeDelegate?
@@ -32,11 +32,26 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
       launchOptions: launchOptions
     )
 
+    // Setup UNUserNotificationCenter delegate to show alerts in foreground & background
+    UNUserNotificationCenter.current().delegate = self
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+      print("[TurboDownloader] User notification permission granted: \(granted)")
+    }
+
     disableFileProtectionForDownloads()
-    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    BackgroundDownloadKeeper.shared.setupRemoteCommandCenter()
     BackgroundDownloadKeeper.shared.startKeepAlive()
 
     return true
+  }
+
+  // Display banner notification even when app is active in foreground
+  func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    completionHandler([.banner, .sound, .badge, .list])
   }
 
   func applicationDidEnterBackground(_ application: UIApplication) {
@@ -48,16 +63,22 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     BackgroundDownloadKeeper.shared.handleDidBecomeActive()
   }
 
-  private func disableFileProtectionForDownloads() {
+  func disableFileProtectionForDownloads() {
     guard let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
     let tdDir = docDir.appendingPathComponent("TurboDownloader")
+    let tmpDir = FileManager.default.temporaryDirectory
+
+    try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: docDir.path)
     try? FileManager.default.createDirectory(at: tdDir, withIntermediateDirectories: true, attributes: [.protectionKey: FileProtectionType.none])
     try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: tdDir.path)
+    try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: tmpDir.path)
 
-    if let enumerator = FileManager.default.enumerator(atPath: tdDir.path) {
-      for case let file as String in enumerator {
-        let fullPath = tdDir.appendingPathComponent(file).path
-        try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: fullPath)
+    for dir in [tdDir, tmpDir] {
+      if let enumerator = FileManager.default.enumerator(atPath: dir.path) {
+        for case let file as String in enumerator {
+          let fullPath = dir.appendingPathComponent(file).path
+          try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: fullPath)
+        }
       }
     }
   }
@@ -69,11 +90,33 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
   private var bgTask: UIBackgroundTaskIdentifier = .invalid
   private var heartbeatTimer: DispatchSourceTimer?
   private var isRunning = false
+  private var cachedArtwork: MPMediaItemArtwork?
 
   func startKeepAlive() {
     setupAudioSessionAndPlayer()
     setupNotifications()
     startHeartbeat()
+  }
+
+  func setupRemoteCommandCenter() {
+    UIApplication.shared.beginReceivingRemoteControlEvents()
+    let commandCenter = MPRemoteCommandCenter.shared()
+
+    commandCenter.playCommand.isEnabled = true
+    commandCenter.playCommand.addTarget { [weak self] _ in
+      self?.ensureAudioPlaying()
+      return .success
+    }
+
+    commandCenter.pauseCommand.isEnabled = true
+    commandCenter.pauseCommand.addTarget { _ in
+      return .success
+    }
+
+    commandCenter.togglePlayPauseCommand.isEnabled = true
+    commandCenter.togglePlayPauseCommand.addTarget { _ in
+      return .success
+    }
   }
 
   private func setupNotifications() {
@@ -101,21 +144,21 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
   func setupAudioSessionAndPlayer() {
     do {
       let session = AVAudioSession.sharedInstance()
-      // Use primary .playback category to gain full, uninhibited background execution privileges
-      try session.setCategory(.playback, mode: .default, options: [])
+      // Use .playback with .mixWithOthers so other apps (LinkedIn, Instagram, Spotify, Twitter) NEVER terminate download keepalive!
+      try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
       try session.setActive(true)
 
       let soundURL = getOrCreateSilenceURL()
       audioPlayer = try AVAudioPlayer(contentsOf: soundURL)
       audioPlayer?.delegate = self
       audioPlayer?.numberOfLoops = -1 // Continuous infinite loop
-      audioPlayer?.volume = 0.5      // Inaudible due to micro-amplitude 20Hz samples; keeps CoreAudio hardware awake
+      audioPlayer?.volume = 0.5      // Inaudible 20Hz micro-sine; keeps CoreAudio hardware awake
       audioPlayer?.prepareToPlay()
 
       let playing = audioPlayer?.play() ?? false
       if playing {
         isRunning = true
-        print("[TurboDownloader] Background audio keep-alive ACTIVE (44.1kHz primary silence loop playing)")
+        print("[TurboDownloader] Background audio keep-alive ACTIVE (.playback + .mixWithOthers)")
       } else {
         isRunning = false
         print("[TurboDownloader] audioPlayer.play() returned false, will retry")
@@ -130,6 +173,12 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
     startBackgroundTask()
     ensureAudioPlaying()
     startHeartbeat()
+    if hasActiveDownloads() {
+      sendLocalNotification(
+        title: "TurboDownloader Active ⚡",
+        body: "Your downloads are continuing smoothly in the background."
+      )
+    }
   }
 
   func handleDidBecomeActive() {
@@ -192,6 +241,9 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
       // Update live Lock Screen & Dynamic Island Now Playing progress
       self.updateNowPlayingProgress()
 
+      // Periodically refresh file permissions to guarantee locked device never blocks writes
+      (UIApplication.shared.delegate as? AppDelegate)?.disableFileProtectionForDownloads()
+
       guard self.hasActiveDownloads() else { return }
 
       // Keep background task alive if invalid
@@ -199,11 +251,11 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
         self.startBackgroundTask()
       }
 
-      // Check and recover audio if stopped (e.g. from third-party app media interruption)
+      // Check and recover audio if stopped
       if self.audioPlayer == nil || self.audioPlayer?.isPlaying == false {
         do {
           let session = AVAudioSession.sharedInstance()
-          try session.setCategory(.playback, mode: .default, options: [])
+          try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
           try session.setActive(true)
           if self.audioPlayer == nil {
             let soundURL = self.getOrCreateSilenceURL()
@@ -218,8 +270,7 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
             print("[TurboDownloader] Heartbeat successfully recovered audio playback")
           }
         } catch {
-          // Another app currently has exclusive audio lock;
-          // bgTask protects us until user scrolls past or audio is released.
+          print("[TurboDownloader] Audio session activation error in heartbeat: \(error)")
         }
       }
     }
@@ -235,7 +286,7 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
       if let data = try? Data(contentsOf: notifyFile),
          let fileName = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
          !fileName.isEmpty {
-        sendLocalNotification(title: "Download Complete", body: "\(fileName) is ready to watch!")
+        sendLocalNotification(title: "Download Complete 🎉", body: "\(fileName) has finished downloading and is ready!")
       }
       try? FileManager.default.removeItem(at: notifyFile)
     }
@@ -245,6 +296,7 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
       if MPNowPlayingInfoCenter.default().nowPlayingInfo != nil {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
       }
       return
     }
@@ -255,9 +307,10 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
     let speed = json["speed"] as? Double ?? 0
 
     let downloadedMB = String(format: "%.1f MB", downloaded / 1048576.0)
-    let totalMB = total > 0 ? String(format: "%.1f MB", total / 1048576.0) : "Unknown"
+    let totalMB = total > 0 ? String(format: "%.1f MB", total / 1048576.0) : "Calculating..."
     let speedStr = speed > 0 ? String(format: "%.1f MB/s", speed / 1048576.0) : "0 MB/s"
-    let percentStr = total > 0 ? String(format: " (%.0f%%)", min(100.0, (downloaded / total) * 100.0)) : ""
+    let percent = total > 0 ? min(100.0, (downloaded / total) * 100.0) : 0
+    let percentStr = total > 0 ? String(format: " (%.0f%%)", percent) : ""
 
     var info = [String: Any]()
     info[MPMediaItemPropertyTitle] = "📥 \(title)"
@@ -270,10 +323,42 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
       info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
     }
 
+    // Generate/cache high-res retina artwork for Lock Screen and Dynamic Island
+    if cachedArtwork == nil {
+      let iconSize = CGSize(width: 256, height: 256)
+      let renderer = UIGraphicsImageRenderer(size: iconSize)
+      let artworkImage = renderer.image { ctx in
+        let colors = [
+          UIColor(red: 0.05, green: 0.45, blue: 0.98, alpha: 1.0).cgColor,
+          UIColor(red: 0.02, green: 0.15, blue: 0.45, alpha: 1.0).cgColor
+        ]
+        if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors as CFArray, locations: [0.0, 1.0]) {
+          ctx.cgContext.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: 0, y: iconSize.height), options: [])
+        }
+
+        let config = UIImage.SymbolConfiguration(pointSize: 100, weight: .bold)
+        if let symbol = UIImage(systemName: "arrow.down.circle.fill", withConfiguration: config)?.withTintColor(.white, renderingMode: .alwaysOriginal) {
+          let symRect = CGRect(
+            x: (iconSize.width - symbol.size.width) / 2,
+            y: (iconSize.height - symbol.size.height) / 2,
+            width: symbol.size.width,
+            height: symbol.size.height
+          )
+          symbol.draw(in: symRect)
+        }
+      }
+      cachedArtwork = MPMediaItemArtwork(boundsSize: iconSize) { _ in artworkImage }
+    }
+
+    if let artwork = cachedArtwork {
+      info[MPMediaItemPropertyArtwork] = artwork
+    }
+
     MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    MPNowPlayingInfoCenter.default().playbackState = .playing
   }
 
-  private func sendLocalNotification(title: String, body: String) {
+  func sendLocalNotification(title: String, body: String) {
     let content = UNMutableNotificationContent()
     content.title = title
     content.body = body
@@ -288,9 +373,14 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
           let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
 
     if type == .began {
-      print("[TurboDownloader] Audio interruption BEGAN (another app started media) - asserting background task")
+      print("[TurboDownloader] Audio interruption BEGAN - asserting background task")
       DispatchQueue.main.async { [weak self] in
         self?.startBackgroundTask()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+          guard let self = self else { return }
+          try? AVAudioSession.sharedInstance().setActive(true)
+          self.audioPlayer?.play()
+        }
       }
     } else if type == .ended {
       print("[TurboDownloader] Audio interruption ENDED - restoring background audio")
@@ -346,12 +436,10 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
   }
 
   private func getOrCreateSilenceURL() -> URL {
-    // 1. Try bundle resource
     if let bundleURL = Bundle.main.url(forResource: "silence", withExtension: "wav") {
       return bundleURL
     }
 
-    // 2. Fallback to Documents directory
     guard let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
       return FileManager.default.temporaryDirectory.appendingPathComponent("silence.wav")
     }
@@ -360,7 +448,6 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
       return fileURL
     }
 
-    // 3. Write standard 44.1kHz 16-bit PCM mono WAV file (2 seconds with sub-audible 20Hz micro-waveform)
     let sampleRate: Int32 = 44100
     let numChannels: Int16 = 1
     let bitsPerSample: Int16 = 16

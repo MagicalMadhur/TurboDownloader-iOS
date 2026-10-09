@@ -240,6 +240,7 @@ class DownloadEngine {
     this.updateDownloadState(id, { status: 'downloading', url });
     this._updateActiveLock();
     this.speedTrackers.set(id, { lastBytes: download.downloadedSize || 0, lastTime: Date.now(), smoothedSpeed: 0, lastNotifyTime: 0 });
+    this._writeProgressForNowPlaying(download.fileName, download.downloadedSize || 0, download.fileSize || 0, 0);
 
     const settings = await storage.getSettings();
     const configuredThreads = Math.min(Math.max(settings.threadsPerDownload || 8, 2), 12);
@@ -299,8 +300,8 @@ class DownloadEngine {
       return;
     }
 
-    // If existing single-stream part file exists OR marked as single-thread on resume:
-    if (hasExistingSinglePart || (!download.isMultiThread && isResume && totalSize > 0)) {
+    // If existing single-stream part file exists:
+    if (hasExistingSinglePart) {
       console.log(`Resuming single-threaded download for ${download.fileName} from existing .part`);
       await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
       return;
@@ -368,15 +369,17 @@ class DownloadEngine {
     }
 
     const threadsToUse = download.threads || configuredThreads;
-    const isVideo = /\.(mp4|mkv|mov|avi|webm|m4v|flv|ts|3gp)$/i.test(download.fileName);
 
-    // For videos and single-thread downloads, sequential streaming directly into .part guarantees 100% bit-perfect playability without chunk corruption
-    if (isVideo || !rangeSupported || totalSize <= 2 * 1024 * 1024 || configuredThreads === 1) {
-      this.updateDownloadState(id, { threads: 1, isMultiThread: false });
-      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
-    } else {
+    // Use fast multi-threaded segmented downloading whenever ranges are supported and size > 2MB.
+    // The segmented architecture uses bit-perfect immutable segments with Range: bytes=${start}-${end}.
+    // Pauses and resumes continue from the exact uncompleted segment without restarting from 0%,
+    // and eliminates byte-splicing corruption for all files including large 4K/1080p MP4/MKV videos!
+    if (rangeSupported && totalSize > 2 * 1024 * 1024 && configuredThreads > 1) {
       this.updateDownloadState(id, { threads: threadsToUse, isMultiThread: true });
       await this._executeMultiThreadDownload(download, totalSize, threadsToUse, requestHeaders);
+    } else {
+      this.updateDownloadState(id, { threads: 1, isMultiThread: false });
+      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
     }
   }
 
@@ -684,14 +687,11 @@ class DownloadEngine {
       } catch (e) {}
 
       // 5. Concatenate segments in order: Segment 0, 1, 2...
-      // As each segment is merged, immediately delete it to minimize flash storage usage!
       await ReactNativeBlobUtil.fs.cp(`${tempPrefix}0`, filePath);
-      try { await ReactNativeBlobUtil.fs.unlink(`${tempPrefix}0`); } catch {}
 
       for (let i = 1; i < numSegments; i++) {
         const segPath = `${tempPrefix}${i}`;
         await ReactNativeBlobUtil.fs.appendFile(filePath, segPath, 'uri');
-        try { await ReactNativeBlobUtil.fs.unlink(segPath); } catch {}
       }
 
       const stat = await ReactNativeBlobUtil.fs.stat(filePath);
@@ -701,6 +701,10 @@ class DownloadEngine {
         throw new Error(`Merged file size mismatch: got ${finalBytes} bytes, expected ${totalSize} bytes`);
       }
 
+      // 6. Delete intermediate segment files and metadata only after final file is strictly verified
+      for (let i = 0; i < numSegments; i++) {
+        try { await ReactNativeBlobUtil.fs.unlink(`${tempPrefix}${i}`); } catch {}
+      }
       try { await ReactNativeBlobUtil.fs.unlink(metaPath); } catch {}
 
       this.updateDownloadState(id, {
@@ -795,7 +799,11 @@ class DownloadEngine {
       const fetchHeaders = { ...requestHeaders };
 
       if (isResuming) {
-        fetchHeaders['Range'] = `bytes=${existingBytes}-`;
+        if (knownTotalSize > 0) {
+          fetchHeaders['Range'] = `bytes=${existingBytes}-${knownTotalSize - 1}`;
+        } else {
+          fetchHeaders['Range'] = `bytes=${existingBytes}-`;
+        }
       }
 
       const config: any = {
