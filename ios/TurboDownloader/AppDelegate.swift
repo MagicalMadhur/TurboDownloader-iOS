@@ -31,20 +31,18 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     )
 
     disableFileProtectionForDownloads()
+    BackgroundDownloadKeeper.shared.startKeepAlive()
 
     return true
   }
 
   func applicationDidEnterBackground(_ application: UIApplication) {
     disableFileProtectionForDownloads()
-    // If active downloads exist, start background keep-alive to prevent iOS 180s deep-sleep kill
-    if hasActiveDownloads() {
-      BackgroundDownloadKeeper.shared.startKeepAlive()
-    }
+    BackgroundDownloadKeeper.shared.handleDidEnterBackground()
   }
 
   func applicationDidBecomeActive(_ application: UIApplication) {
-    BackgroundDownloadKeeper.shared.stopKeepAlive()
+    BackgroundDownloadKeeper.shared.handleDidBecomeActive()
   }
 
   private func disableFileProtectionForDownloads() {
@@ -53,59 +51,87 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     try? FileManager.default.createDirectory(at: tdDir, withIntermediateDirectories: true, attributes: [.protectionKey: FileProtectionType.none])
     try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: tdDir.path)
   }
-
-  private func hasActiveDownloads() -> Bool {
-    guard let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
-      return false
-    }
-    let lockFile = docDir.appendingPathComponent("TurboDownloader/.active_download_lock")
-    return FileManager.default.fileExists(atPath: lockFile.path)
-  }
 }
 
-class BackgroundDownloadKeeper: NSObject {
+class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
   static let shared = BackgroundDownloadKeeper()
   private var audioPlayer: AVAudioPlayer?
   private var bgTask: UIBackgroundTaskIdentifier = .invalid
+  private var isRunning = false
 
   func startKeepAlive() {
-    if bgTask == .invalid {
-      bgTask = UIApplication.shared.beginBackgroundTask(withName: "TurboDownloaderNightBG") { [weak self] in
-        self?.endBackgroundTask()
-      }
-    }
+    guard !isRunning else { return }
+    isRunning = true
 
     do {
       let session = AVAudioSession.sharedInstance()
       try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
       try session.setActive(true)
 
-      if audioPlayer == nil {
-        let soundData = generateSilentAudioWav()
-        audioPlayer = try AVAudioPlayer(data: soundData)
-        audioPlayer?.numberOfLoops = -1
-        audioPlayer?.volume = 0.01
-        audioPlayer?.prepareToPlay()
-      }
+      let soundData = generateSilentAudioWav()
+      audioPlayer = try AVAudioPlayer(data: soundData)
+      audioPlayer?.delegate = self
+      audioPlayer?.numberOfLoops = -1 // Infinite loop
+      audioPlayer?.volume = 0.001     // Inaudible
+      audioPlayer?.prepareToPlay()
       audioPlayer?.play()
-      print("[TurboDownloader] Background download keep-alive ACTIVE")
+      NotificationCenter.default.addObserver(
+        self,
+        selector: #selector(handleAudioInterruption(_:)),
+        name: AVAudioSession.interruptionNotification,
+        object: nil
+      )
+
+      print("[TurboDownloader] Background download keep-alive ACTIVE (silent audio loop)")
     } catch {
       print("[TurboDownloader] Background session error: \(error)")
     }
   }
 
-  func stopKeepAlive() {
-    audioPlayer?.stop()
-    audioPlayer = nil
-    try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+  @objc private func handleAudioInterruption(_ notification: Notification) {
+    guard let userInfo = notification.userInfo,
+          let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+          let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
+
+    if type == .ended {
+      if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+        let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+        if options.contains(.shouldResume) {
+          audioPlayer?.play()
+        }
+      } else {
+        audioPlayer?.play()
+      }
+    }
+  }
+
+  func handleDidEnterBackground() {
+    // Assert background task to give extra runway
+    if bgTask == .invalid {
+      bgTask = UIApplication.shared.beginBackgroundTask(withName: "TurboDownloaderBG") { [weak self] in
+        self?.endBackgroundTask()
+      }
+    }
+
+    // Ensure audio player is actively playing
+    if audioPlayer == nil || audioPlayer?.isPlaying == false {
+      startKeepAlive()
+    }
+  }
+
+  func handleDidBecomeActive() {
     endBackgroundTask()
-    print("[TurboDownloader] Background download keep-alive STOPPED")
+    // Keep audio player active to avoid failure when re-entering background
+    if audioPlayer == nil || audioPlayer?.isPlaying == false {
+      startKeepAlive()
+    }
   }
 
   private func endBackgroundTask() {
     if bgTask != .invalid {
-      UIApplication.shared.endBackgroundTask(bgTask)
+      let task = bgTask
       bgTask = .invalid
+      UIApplication.shared.endBackgroundTask(task)
     }
   }
 
