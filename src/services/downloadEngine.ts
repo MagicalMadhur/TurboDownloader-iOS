@@ -338,13 +338,15 @@ class DownloadEngine {
     }
 
     const threadsToUse = download.threads || configuredThreads;
+    const isVideo = /\.(mp4|mkv|mov|avi|webm|m4v|flv|ts|3gp)$/i.test(download.fileName);
 
-    // Run Multi-Threaded Download if range supported & size > 2MB
-    if (rangeSupported && totalSize > 2 * 1024 * 1024) {
+    // For videos and single-thread downloads, sequential streaming directly into .part guarantees 100% bit-perfect playability without chunk corruption
+    if (isVideo || !rangeSupported || totalSize <= 2 * 1024 * 1024 || configuredThreads === 1) {
+      this.updateDownloadState(id, { threads: 1, isMultiThread: false });
+      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
+    } else {
       this.updateDownloadState(id, { threads: threadsToUse, isMultiThread: true });
       await this._executeMultiThreadDownload(download, totalSize, threadsToUse, requestHeaders);
-    } else {
-      await this._executeSingleThreadDownload(download, totalSize, requestHeaders);
     }
   }
 

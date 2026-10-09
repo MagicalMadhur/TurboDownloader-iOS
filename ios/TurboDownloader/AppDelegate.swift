@@ -50,6 +50,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     let tdDir = docDir.appendingPathComponent("TurboDownloader")
     try? FileManager.default.createDirectory(at: tdDir, withIntermediateDirectories: true, attributes: [.protectionKey: FileProtectionType.none])
     try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: tdDir.path)
+
+    if let enumerator = FileManager.default.enumerator(atPath: tdDir.path) {
+      for case let file as String in enumerator {
+        let fullPath = tdDir.appendingPathComponent(file).path
+        try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.none], ofItemAtPath: fullPath)
+      }
+    }
   }
 }
 
@@ -91,7 +98,8 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
   func setupAudioSessionAndPlayer() {
     do {
       let session = AVAudioSession.sharedInstance()
-      try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+      // Use primary .playback category to gain full, uninhibited background execution privileges
+      try session.setCategory(.playback, mode: .default, options: [])
       try session.setActive(true)
 
       let soundURL = getOrCreateSilenceURL()
@@ -104,7 +112,7 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
       let playing = audioPlayer?.play() ?? false
       if playing {
         isRunning = true
-        print("[TurboDownloader] Background audio keep-alive ACTIVE (44.1kHz silence loop playing)")
+        print("[TurboDownloader] Background audio keep-alive ACTIVE (44.1kHz primary silence loop playing)")
       } else {
         isRunning = false
         print("[TurboDownloader] audioPlayer.play() returned false, will retry")
@@ -128,34 +136,19 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
 
   func startBackgroundTask() {
     if bgTask != .invalid {
-      UIApplication.shared.endBackgroundTask(bgTask)
+      let task = bgTask
       bgTask = .invalid
+      UIApplication.shared.endBackgroundTask(task)
     }
     bgTask = UIApplication.shared.beginBackgroundTask(withName: "TurboDownloaderBG") { [weak self] in
-      self?.renewBackgroundTask()
+      guard let self = self else { return }
+      let task = self.bgTask
+      self.bgTask = .invalid
+      if task != .invalid {
+        UIApplication.shared.endBackgroundTask(task)
+      }
     }
     print("[TurboDownloader] Background task asserted: \(bgTask.rawValue)")
-  }
-
-  func renewBackgroundTask() {
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      let oldTask = self.bgTask
-
-      if self.hasActiveDownloads() {
-        self.ensureAudioPlaying()
-        self.bgTask = UIApplication.shared.beginBackgroundTask(withName: "TurboDownloaderBG") { [weak self] in
-          self?.renewBackgroundTask()
-        }
-        print("[TurboDownloader] Background task renewed: \(self.bgTask.rawValue)")
-      } else {
-        self.bgTask = .invalid
-      }
-
-      if oldTask != .invalid {
-        UIApplication.shared.endBackgroundTask(oldTask)
-      }
-    }
   }
 
   private func endBackgroundTask() {
