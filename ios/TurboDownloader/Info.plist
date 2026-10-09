@@ -39,9 +39,8 @@
 	<!-- Enable background modes for downloads -->
 	<key>UIBackgroundModes</key>
 	<array>
-		<string>fetch</string>
-		<string>processing</string>
 		<string>audio</string>
+		<string>fetch</string>
 	</array>
 	<!-- Enable iOS Live Activities & Dynamic Island -->
 	<key>NSSupportsLiveActivities</key>
