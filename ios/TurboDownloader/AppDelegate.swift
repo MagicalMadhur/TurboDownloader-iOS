@@ -3,6 +3,8 @@ import React
 import React_RCTAppDelegate
 import ReactAppDependencyProvider
 import AVFoundation
+import MediaPlayer
+import UserNotifications
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
@@ -31,6 +33,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     )
 
     disableFileProtectionForDownloads()
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     BackgroundDownloadKeeper.shared.startKeepAlive()
 
     return true
@@ -183,10 +186,13 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
   }
 
   private func heartbeat() {
-    guard hasActiveDownloads() else { return }
-
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
+
+      // Update live Lock Screen & Dynamic Island Now Playing progress
+      self.updateNowPlayingProgress()
+
+      guard self.hasActiveDownloads() else { return }
 
       // Keep background task alive if invalid
       if self.bgTask == .invalid {
@@ -197,7 +203,7 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
       if self.audioPlayer == nil || self.audioPlayer?.isPlaying == false {
         do {
           let session = AVAudioSession.sharedInstance()
-          try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+          try session.setCategory(.playback, mode: .default, options: [])
           try session.setActive(true)
           if self.audioPlayer == nil {
             let soundURL = self.getOrCreateSilenceURL()
@@ -212,11 +218,68 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
             print("[TurboDownloader] Heartbeat successfully recovered audio playback")
           }
         } catch {
-          // Another app (e.g. LinkedIn / YouTube) currently has exclusive audio lock;
+          // Another app currently has exclusive audio lock;
           // bgTask protects us until user scrolls past or audio is released.
         }
       }
     }
+  }
+
+  func updateNowPlayingProgress() {
+    guard let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+    let progressFile = docDir.appendingPathComponent("TurboDownloader/.active_progress.json")
+    let notifyFile = docDir.appendingPathComponent("TurboDownloader/.download_complete_notify")
+
+    // Check if a completion notification was requested
+    if FileManager.default.fileExists(atPath: notifyFile.path) {
+      if let data = try? Data(contentsOf: notifyFile),
+         let fileName = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+         !fileName.isEmpty {
+        sendLocalNotification(title: "Download Complete", body: "\(fileName) is ready to watch!")
+      }
+      try? FileManager.default.removeItem(at: notifyFile)
+    }
+
+    guard FileManager.default.fileExists(atPath: progressFile.path),
+          let data = try? Data(contentsOf: progressFile),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      if MPNowPlayingInfoCenter.default().nowPlayingInfo != nil {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+      }
+      return
+    }
+
+    let title = json["title"] as? String ?? "Downloading file..."
+    let downloaded = json["downloaded"] as? Double ?? 0
+    let total = json["total"] as? Double ?? 0
+    let speed = json["speed"] as? Double ?? 0
+
+    let downloadedMB = String(format: "%.1f MB", downloaded / 1048576.0)
+    let totalMB = total > 0 ? String(format: "%.1f MB", total / 1048576.0) : "Unknown"
+    let speedStr = speed > 0 ? String(format: "%.1f MB/s", speed / 1048576.0) : "0 MB/s"
+    let percentStr = total > 0 ? String(format: " (%.0f%%)", min(100.0, (downloaded / total) * 100.0)) : ""
+
+    var info = [String: Any]()
+    info[MPMediaItemPropertyTitle] = "📥 \(title)"
+    info[MPMediaItemPropertyArtist] = "TurboDownloader • \(speedStr)"
+    info[MPMediaItemPropertyAlbumTitle] = "\(downloadedMB) / \(totalMB)\(percentStr)"
+
+    if total > 0 {
+      info[MPMediaItemPropertyPlaybackDuration] = total
+      info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = downloaded
+      info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+    }
+
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+  }
+
+  private func sendLocalNotification(title: String, body: String) {
+    let content = UNMutableNotificationContent()
+    content.title = title
+    content.body = body
+    content.sound = .default
+    let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+    UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
   }
 
   @objc private func handleAudioInterruption(_ notification: Notification) {

@@ -76,6 +76,36 @@ class DownloadEngine {
     } catch {}
   }
 
+  private lastProgressWriteTime = 0;
+  private async _writeProgressForNowPlaying(title: string, downloaded: number, total: number, speed: number): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastProgressWriteTime < 1000) return;
+    this.lastProgressWriteTime = now;
+    try {
+      const downloadDir = this.getDownloadDir();
+      const progressPath = `${downloadDir}/TurboDownloader/.active_progress.json`;
+      await ReactNativeBlobUtil.fs.writeFile(
+        progressPath,
+        JSON.stringify({ title, downloaded, total, speed }),
+        'utf8'
+      );
+    } catch {}
+  }
+
+  private async _clearProgressForNowPlaying(completedFileName?: string): Promise<void> {
+    try {
+      const downloadDir = this.getDownloadDir();
+      const progressPath = `${downloadDir}/TurboDownloader/.active_progress.json`;
+      if (await ReactNativeBlobUtil.fs.exists(progressPath)) {
+        await ReactNativeBlobUtil.fs.unlink(progressPath);
+      }
+      if (completedFileName) {
+        const notifyPath = `${downloadDir}/TurboDownloader/.download_complete_notify`;
+        await ReactNativeBlobUtil.fs.writeFile(notifyPath, completedFileName, 'utf8');
+      }
+    } catch {}
+  }
+
   async initialize(): Promise<void> {
     this.downloads = await storage.getDownloads();
     const settings = await storage.getSettings();
@@ -492,6 +522,7 @@ class DownloadEngine {
           progress: safeProgress,
           speed: cleanSpeed,
         });
+        this._writeProgressForNowPlaying(download.fileName, currentTotal, safeTotal, cleanSpeed);
       }
     };
 
@@ -685,6 +716,7 @@ class DownloadEngine {
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
       this.retryAttempts.delete(id);
+      await this._clearProgressForNowPlaying(download.fileName);
       this._updateActiveLock();
       await this._persistState();
       this._processQueue();
@@ -829,6 +861,7 @@ class DownloadEngine {
               progress: safeProgress,
               speed: cleanSpeed,
             });
+            this._writeProgressForNowPlaying(download.fileName, currentReceived, actualTotal, cleanSpeed);
           }
         });
 
@@ -928,6 +961,7 @@ class DownloadEngine {
       this.activeDownloads.delete(id);
       this.speedTrackers.delete(id);
       this.retryAttempts.delete(id);
+      await this._clearProgressForNowPlaying(finalName);
       this._updateActiveLock();
       await this._persistState();
       this._processQueue();
@@ -1069,6 +1103,7 @@ class DownloadEngine {
     }
 
     await this._persistState();
+    await this._clearProgressForNowPlaying();
     this._updateActiveLock();
     this._processQueue();
   }
@@ -1113,6 +1148,7 @@ class DownloadEngine {
       status: 'cancelled',
       speed: 0,
     });
+    await this._clearProgressForNowPlaying();
 
     // Clean up temporary segment and meta files
     const downloadDir = this.getDownloadDir();
