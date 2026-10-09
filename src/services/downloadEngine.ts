@@ -81,15 +81,29 @@ class DownloadEngine {
     const settings = await storage.getSettings();
     this.maxConcurrent = settings.maxSimultaneousDownloads;
 
-    // Reset any downloads that were "downloading" when app closed
+    const interrupted = this.downloads.filter(d => d.status === 'downloading');
+
+    // Reset speeds for fresh start
     this.downloads = this.downloads.map(d => {
       if (d.status === 'downloading') {
-        return { ...d, status: 'paused' as const, speed: 0 };
+        return { ...d, speed: 0 };
       }
       return d;
     });
     await storage.saveDownloads(this.downloads);
     this.notifyListeners();
+
+    // Auto-resume active downloads seamlessly!
+    if (interrupted.length > 0) {
+      console.log(`[Initialize] Auto-resuming ${interrupted.length} active downloads...`);
+      setTimeout(() => {
+        interrupted.forEach(d => {
+          this.resumeDownload(d.id).catch(err => {
+            console.error('Failed to auto-resume download:', err);
+          });
+        });
+      }, 300);
+    }
   }
 
   subscribe(callback: DownloadListCallback): () => void {

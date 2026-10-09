@@ -56,9 +56,39 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
   static let shared = BackgroundDownloadKeeper()
   private var audioPlayer: AVAudioPlayer?
+  private var bgTask: UIBackgroundTaskIdentifier = .invalid
+  private var heartbeatTimer: DispatchSourceTimer?
   private var isRunning = false
 
   func startKeepAlive() {
+    setupAudioSessionAndPlayer()
+    setupNotifications()
+    startHeartbeat()
+  }
+
+  private func setupNotifications() {
+    NotificationCenter.default.removeObserver(self)
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAudioInterruption(_:)),
+      name: AVAudioSession.interruptionNotification,
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleAudioRouteChange(_:)),
+      name: AVAudioSession.routeChangeNotification,
+      object: nil
+    )
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(handleMediaServicesReset(_:)),
+      name: AVAudioSession.mediaServicesWereResetNotification,
+      object: nil
+    )
+  }
+
+  func setupAudioSessionAndPlayer() {
     do {
       let session = AVAudioSession.sharedInstance()
       try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
@@ -70,7 +100,7 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
       audioPlayer?.numberOfLoops = -1 // Continuous infinite loop
       audioPlayer?.volume = 0.5      // Inaudible due to micro-amplitude 20Hz samples; keeps CoreAudio hardware awake
       audioPlayer?.prepareToPlay()
-      
+
       let playing = audioPlayer?.play() ?? false
       if playing {
         isRunning = true
@@ -79,29 +109,120 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
         isRunning = false
         print("[TurboDownloader] audioPlayer.play() returned false, will retry")
       }
-
-      NotificationCenter.default.removeObserver(self)
-      NotificationCenter.default.addObserver(
-        self,
-        selector: #selector(handleAudioInterruption(_:)),
-        name: AVAudioSession.interruptionNotification,
-        object: nil
-      )
-      NotificationCenter.default.addObserver(
-        self,
-        selector: #selector(handleAudioRouteChange(_:)),
-        name: AVAudioSession.routeChangeNotification,
-        object: nil
-      )
-      NotificationCenter.default.addObserver(
-        self,
-        selector: #selector(handleMediaServicesReset(_:)),
-        name: AVAudioSession.mediaServicesWereResetNotification,
-        object: nil
-      )
     } catch {
       isRunning = false
       print("[TurboDownloader] Background session error: \(error)")
+    }
+  }
+
+  func handleDidEnterBackground() {
+    startBackgroundTask()
+    ensureAudioPlaying()
+    startHeartbeat()
+  }
+
+  func handleDidBecomeActive() {
+    endBackgroundTask()
+    ensureAudioPlaying()
+  }
+
+  func startBackgroundTask() {
+    if bgTask != .invalid {
+      UIApplication.shared.endBackgroundTask(bgTask)
+      bgTask = .invalid
+    }
+    bgTask = UIApplication.shared.beginBackgroundTask(withName: "TurboDownloaderBG") { [weak self] in
+      self?.renewBackgroundTask()
+    }
+    print("[TurboDownloader] Background task asserted: \(bgTask.rawValue)")
+  }
+
+  func renewBackgroundTask() {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      let oldTask = self.bgTask
+
+      if self.hasActiveDownloads() {
+        self.ensureAudioPlaying()
+        self.bgTask = UIApplication.shared.beginBackgroundTask(withName: "TurboDownloaderBG") { [weak self] in
+          self?.renewBackgroundTask()
+        }
+        print("[TurboDownloader] Background task renewed: \(self.bgTask.rawValue)")
+      } else {
+        self.bgTask = .invalid
+      }
+
+      if oldTask != .invalid {
+        UIApplication.shared.endBackgroundTask(oldTask)
+      }
+    }
+  }
+
+  private func endBackgroundTask() {
+    if bgTask != .invalid {
+      let task = bgTask
+      bgTask = .invalid
+      UIApplication.shared.endBackgroundTask(task)
+      print("[TurboDownloader] Background task ended")
+    }
+  }
+
+  func ensureAudioPlaying() {
+    if audioPlayer == nil || audioPlayer?.isPlaying == false {
+      setupAudioSessionAndPlayer()
+    }
+  }
+
+  private func startHeartbeat() {
+    stopHeartbeat()
+    let timer = DispatchSource.makeTimerSource(flags: [], queue: DispatchQueue.global(qos: .userInitiated))
+    timer.schedule(deadline: .now() + 2.0, repeating: 2.0)
+    timer.setEventHandler { [weak self] in
+      self?.heartbeat()
+    }
+    timer.resume()
+    heartbeatTimer = timer
+  }
+
+  private func stopHeartbeat() {
+    heartbeatTimer?.cancel()
+    heartbeatTimer = nil
+  }
+
+  private func heartbeat() {
+    guard hasActiveDownloads() else { return }
+
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+
+      // Keep background task alive if invalid
+      if self.bgTask == .invalid {
+        self.startBackgroundTask()
+      }
+
+      // Check and recover audio if stopped (e.g. from third-party app media interruption)
+      if self.audioPlayer == nil || self.audioPlayer?.isPlaying == false {
+        do {
+          let session = AVAudioSession.sharedInstance()
+          try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+          try session.setActive(true)
+          if self.audioPlayer == nil {
+            let soundURL = self.getOrCreateSilenceURL()
+            self.audioPlayer = try AVAudioPlayer(contentsOf: soundURL)
+            self.audioPlayer?.delegate = self
+            self.audioPlayer?.numberOfLoops = -1
+            self.audioPlayer?.volume = 0.5
+            self.audioPlayer?.prepareToPlay()
+          }
+          if self.audioPlayer?.isPlaying == false {
+            self.audioPlayer?.play()
+            print("[TurboDownloader] Heartbeat successfully recovered audio playback")
+          }
+        } catch {
+          // Another app (e.g. LinkedIn / YouTube) currently has exclusive audio lock;
+          // bgTask protects us until user scrolls past or audio is released.
+        }
+      }
     }
   }
 
@@ -110,48 +231,62 @@ class BackgroundDownloadKeeper: NSObject, AVAudioPlayerDelegate {
           let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
           let type = AVAudioSession.InterruptionType(rawValue: typeValue) else { return }
 
-    if type == .ended {
-      try? AVAudioSession.sharedInstance().setActive(true)
-      audioPlayer?.play()
-      print("[TurboDownloader] Resumed background keep-alive after audio interruption")
+    if type == .began {
+      print("[TurboDownloader] Audio interruption BEGAN (another app started media) - asserting background task")
+      DispatchQueue.main.async { [weak self] in
+        self?.startBackgroundTask()
+      }
+    } else if type == .ended {
+      print("[TurboDownloader] Audio interruption ENDED - restoring background audio")
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        do {
+          let session = AVAudioSession.sharedInstance()
+          try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+          try session.setActive(true)
+          self.audioPlayer?.play()
+        } catch {
+          print("[TurboDownloader] Failed to resume audio after interruption: \(error)")
+        }
+      }
     }
   }
 
   @objc private func handleAudioRouteChange(_ notification: Notification) {
     if audioPlayer == nil || audioPlayer?.isPlaying == false {
-      try? AVAudioSession.sharedInstance().setActive(true)
-      audioPlayer?.play()
-      print("[TurboDownloader] Resumed background keep-alive after audio route change")
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        self.audioPlayer?.play()
+        print("[TurboDownloader] Resumed background keep-alive after audio route change")
+      }
     }
   }
 
   @objc private func handleMediaServicesReset(_ notification: Notification) {
     print("[TurboDownloader] Media services reset, recreating player")
     isRunning = false
-    startKeepAlive()
+    DispatchQueue.main.async { [weak self] in
+      self?.setupAudioSessionAndPlayer()
+    }
   }
 
   func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-    // Should never finish with numberOfLoops = -1, but restart immediately if it does
     audioPlayer?.play()
   }
 
   func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
     print("[TurboDownloader] Audio decode error: \(String(describing: error)), recreating player")
     isRunning = false
-    startKeepAlive()
+    setupAudioSessionAndPlayer()
   }
 
-  func handleDidEnterBackground() {
-    if audioPlayer == nil || audioPlayer?.isPlaying == false {
-      startKeepAlive()
+  func hasActiveDownloads() -> Bool {
+    guard let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+      return false
     }
-  }
-
-  func handleDidBecomeActive() {
-    if audioPlayer == nil || audioPlayer?.isPlaying == false {
-      startKeepAlive()
-    }
+    let lockFile = docDir.appendingPathComponent("TurboDownloader/.active_download_lock")
+    return FileManager.default.fileExists(atPath: lockFile.path)
   }
 
   private func getOrCreateSilenceURL() -> URL {
